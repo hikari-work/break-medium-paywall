@@ -1,0 +1,245 @@
+# Docker Compose untuk VPS produksi (77.237.246.155), dilayani di
+# medium.piyann.my.id.
+#
+# # Kenapa file ini berdiri sendiri, bukan override dari `main.yml`
+#
+# Profil `local`/`min`/`prod` di `docker-compose.main.yml` mengkodekan topologi
+# **repo ini**, dan topologi itu bukan topologi VPS:
+#
+#   * `caddy_freedium` memegang :80/:443. Di VPS, nginx host sudah memegangnya
+#     untuk lima vhost lain, jadi container Caddy tidak dijalankan sama sekali.
+#   * `caddy_net` adalah `external: true` (`main.yml:299`). Network itu tidak
+#     ada di VPS, sehingga setiap profil yang menyertakan Caddy akan gagal
+#     sebelum container pertama naik.
+#   * `freedium_web_rust` ada di profil `local` saja, dengan `SHADOW_MODE=true`
+#     dan `ports: 7081:7080` (`main.yml:187,200`) — bentuknya untuk bayangan,
+#     bukan untuk instance yang melayani.
+#   * `redis_service` meminta `mem_limit: 5g` (`db.yml:30`). Wajar di mesin
+#     khusus; di sini, dengan 6,1 GB tersedia dan lima belas container lain,
+#     angka itu melebihi apa yang boleh diambil satu service.
+#
+# Menumpuk override dan profil di atas tiga file untuk menghasilkan bentuk yang
+# berbeda akan menyembunyikan perbedaan itu alih-alih menjelaskannya. Yang
+# diduplikasi hanya kerangka service; **isi** yang di-bind-mount tetap milik
+# repo (`wgcf/entry.sh`, `wgcf/dante/sockd.conf`), jadi tidak ada salinan kedua
+# dari apa pun yang punya arti.
+#
+# # Cara menjalankan
+#
+# Dari root checkout di VPS (`/root/freedium`), dengan `.env` di root itu:
+#
+#     docker compose --env-file .env -f docker-compose/docker-compose.vps.yml up -d
+#
+# `--env-file` bukan hiasan: interpolasi `${...}` di file ini dibaca dari shell
+# dan `.env` di direktori **compose file** (yaitu `docker-compose/`), bukan dari
+# `env_file` milik service. Tanpa flag itu, `POSTGRES_PASSWORD` tidak ditemukan
+# dan compose berhenti dengan error yang menyebut variabelnya — itu disengaja,
+# lihat `:?` di bawah.
+
+name: freedium
+
+services:
+  freedium_web_rust:
+    image: ghcr.io/hikari-work/freedium-web:${FREEDIUM_TAG:-latest}
+    container_name: freedium_web_rust
+    hostname: freedium_web_rust
+
+    env_file: ../.env
+
+    environment:
+      # Konfigurasi aplikasi yang tersisa (TIMEOUT, ADMIN_SECRET_KEY,
+      # MEDIUM_AUTH_COOKIES, API_*, CORS_*_ORIGINS, TELEGRAM_*) datang dari
+      # `env_file` di atas. Yang di bawah ini adalah yang **harus** berbeda di
+      # container, dan sengaja literal alih-alih `${VAR:-default}`: interpolasi
+      # membaca shell operator juga, sehingga satu variabel yang ter-export
+      # bisa diam-diam mengubah stack ini. Alasan yang sama ditulis di
+      # `main.yml:93-98`, dan di sini taruhannya lebih tinggi karena ini
+      # instance produksi.
+      - "HOST_ADDRESS=https://medium.piyann.my.id"
+      - "DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD harus diisi di .env}@postgres_freedium:5432/postgres"
+      - "REDIS_HOST=redis_service"
+      - "REDIS_PORT=6379"
+      # Pool WARP. Nilai yang sama dengan default Python di `main.yml:120`.
+      # Pool gagal **tertutup** (`proxy.rs:265-281` → `FetchError::NoHealthyProxy`),
+      # jadi exit yang rusak menghasilkan error yang berisik, bukan fetch diam-diam
+      # langsung dari IP datacenter — yang justru kasus yang dihindari pool ini.
+      - "PROXY_LIST=socks5://wgcf1:1080"
+      # Instance ini melayani user sungguhan. `SHADOW_MODE` menggerbangi dua hal
+      # sekaligus: penolakan cache miss (`post.rs:562`) dan `should_alert`
+      # (`error.rs:259-260`). `false` berarti fetch nyata ke Medium **dan**
+      # notifikasi Telegram hidup. Komentar di `main.yml:184-187` berbunyi
+      # "must never be `true` on the instance serving real users".
+      - "SHADOW_MODE=false"
+
+    ports:
+      # **Loopback saja.** nginx host yang menghadap publik dan meneruskan ke
+      # sini; container tidak boleh punya jalan masuk kedua yang melewatinya.
+      # Lima service lain di mesin ini melakukan hal yang sama
+      # (`127.0.0.1:8082`, `:3001`, `:9443`, ...).
+      #
+      # 7080 dipilih karena itu port yang sudah dipakai service ini di dalam
+      # container (`EXPOSE 7080` di Dockerfile-nya) dan karena ia kosong di
+      # host. :5432 dan :6379 **tidak** kosong — keduanya dipegang container
+      # lain — dan itulah kenapa Postgres dan Dragonfly di bawah tidak
+      # mempublikasikan port sama sekali.
+      - "127.0.0.1:7080:7080"
+
+    depends_on:
+      postgres_freedium:
+        condition: service_healthy
+      redis_service:
+        condition: service_healthy
+      # `AppState::new` menyelesaikan handshake Redis saat boot, jadi urutannya
+      # bukan kenyamanan. wgcf1 juga ditunggu: instance yang naik sebelum
+      # tunnelnya siap akan gagal pada request dingin pertama, dan kegagalan itu
+      # mudah salah dibaca sebagai masalah fingerprint TLS.
+      wgcf1:
+        condition: service_healthy
+
+    healthcheck:
+      # `CMD`, bukan `CMD-SHELL`: runtime-nya distroless, jadi tidak ada shell
+      # untuk menerima string perintah dan tidak ada `curl` untuk dijalankan.
+      # `CMD-SHELL` di image tanpa shell **selalu** gagal, dan autoheal mana pun
+      # akan me-restart container yang sebenarnya sehat, berulang-ulang.
+      test: [ "CMD", "/app/freedium-web", "healthcheck" ]
+      interval: 30s
+      start_period: 20s
+      timeout: 90s
+      retries: 3
+
+    mem_limit: 2g
+    restart: always
+    stop_grace_period: 1m
+
+  postgres_freedium:
+    image: postgres:16.3-alpine3.20
+    container_name: postgres_freedium
+    hostname: postgres_freedium
+
+    environment:
+      - "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?}"
+      - "POSTGRES_USER=postgres"
+      - "POSTGRES_DB=postgres"
+
+    volumes:
+      # **Named volume, bukan bind mount `../postgres` seperti `db.yml:39`.**
+      # Di VPS, `/root/freedium` adalah checkout git yang sesekali di-`pull` dan
+      # sesekali di-`clean`; menaruh database di dalamnya membuat satu perintah
+      # rutin menghapus seluruh isi cache. Named volume tidak bisa tersentuh
+      # git.
+      - freedium_pgdata:/var/lib/postgresql/data
+
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+    mem_limit: 512m
+    restart: always
+    stop_grace_period: 2m
+
+  redis_service:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly
+    container_name: redis_service
+    hostname: redis_service
+
+    command: [ "--maxmemory=768mb" ]
+    ulimits:
+      memlock: -1
+
+    volumes:
+      - freedium_dragonflydata:/data
+
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 30s
+      start_period: 20s
+      timeout: 10s
+      retries: 3
+
+    # `db.yml:30` meminta 5g. Angka itu masuk akal di mesin yang seluruhnya
+    # milik stack ini; di sini ia akan melebihi RAM yang tersedia bersama empat
+    # belas container lain begitu Postgres dan server ikut dihitung.
+    mem_limit: 1g
+    restart: always
+    stop_grace_period: 2m
+
+  # --- Pool WARP ------------------------------------------------------------
+  #
+  # Ketiganya dijalankan karena instance produksi **tidak** fetch langsung dari
+  # IP datacenter. Diukur 2026-09-12: `curl` dengan header produksi yang identik
+  # kena 403 halaman blokir Cloudflare dari alamat yang sama, sementara klien
+  # yang mengimpersonasi lolos. Bot score Cloudflare didominasi reputasi IP, dan
+  # IP datacenter justru tempat ia menggigit.
+  wgcf1:
+    image: neilpang/wgcf-docker:latest
+    container_name: wgcf1
+    volumes:
+      - /lib/modules:/lib/modules
+      - /etc/localtime:/etc/localtime:ro
+      - ../wgcf/entry.sh:/entry.sh
+    # `privileged` dibutuhkan untuk membuat interface WireGuard. Di mesin
+    # bersama ini adalah konsekuensi yang dibeli bersama keputusan memakai
+    # pool — bukan detail yang bisa dihilangkan.
+    privileged: true
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 0
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: curl -fs https://www.cloudflare.com/cdn-cgi/trace | grep -q -E 'warp=(on|plus)' && exit 0 || exit 1
+      interval: 5s
+      timeout: 2s
+      # Tinggi dengan sengaja: tunnel WARP yang mati akan dicoba ulang sampai
+      # hidup, dan menandai container `unhealthy` hanya akan memicu restart yang
+      # tidak memperbaiki apa pun. `wgcf1_healthcare_service` di bawah yang
+      # menangani kasus itu.
+      retries: 10000
+    mem_limit: 256m
+    restart: always
+
+  dante_1:
+    image: shturman/dante:1.4.2
+    container_name: dante_1
+    volumes:
+      - ../wgcf/dante/sockd.conf:/etc/sockd.conf
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - CFGFILE=/etc/sockd.conf
+    # Berbagi network namespace dengan wgcf1 — itulah mekanismenya: Dante
+    # mendengarkan :1080 di dalam netns wgcf1, sehingga lalu lintasnya keluar
+    # lewat tunnel. Karena itu `PROXY_LIST` menunjuk `wgcf1:1080` dan bukan
+    # `dante_1:1080`.
+    network_mode: "service:wgcf1"
+    depends_on:
+      wgcf1:
+        condition: service_healthy
+    mem_limit: 128m
+    restart: always
+
+  wgcf1_healthcare_service:
+    image: ghcr.io/hikari-work/freedium-wgcf-healthcare:${FREEDIUM_TAG:-latest}
+    container_name: wgcf1_healthcare_service
+    environment:
+      # Dibaca compose sebagai interpolasi, jadi sumbernya `.env` di samping
+      # file compose — bukan `env_file` mana pun. Ini jebakan yang sama seperti
+      # di atas, dan satu-satunya tempat ia menggigit di sini.
+      - "TG_TOKEN=${TELEGRAM_BOT_TOKEN:-}"
+      - "TG_CHAT_ID=${TELEGRAM_ADMIN_ID:-}"
+      - "CONTAINERS_TO_RESTART=wgcf1,dante_1"
+      - "PROXY_HOST=wgcf1"
+      - "PROXY_PORT=1080"
+      - "SLEEP_DURATION=30"
+    volumes:
+      # Tugasnya me-restart wgcf1 dan dante_1; tidak ada jalan lain untuk itu.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - wgcf1
+    mem_limit: 64m
+    restart: always
+
+volumes:
+  freedium_pgdata:
+  freedium_dragonflydata:
