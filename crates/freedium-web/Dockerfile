@@ -108,15 +108,27 @@ COPY --from=planner /src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json
 
-# --- the binary --------------------------------------------------------------
+# --- the binaries ------------------------------------------------------------
 FROM chef AS build
 COPY . .
 # The cooked dependencies, before the sources, so that this layer survives a
 # source edit. `.dockerignore` excludes `target/`, so the `COPY . .` above does
 # not clobber what the cook stage produced.
 COPY --from=cook /src/target target
+#
+# Two binaries, one image. `freedium-bot` is the Telegram article bot — a
+# process that shares this image's Rust workspace, its `Cargo.lock`, and its
+# `freedium-dto`, but none of its ports and none of its boot requirements. It is
+# built here rather than in an image of its own because everything it needs is
+# already a layer: the same cooked dependency tree, the same BoringSSL, the same
+# distroless runtime. A second image would rebuild all of that to add one file
+# to a container that already has the other one.
+#
+# Building both in one `cargo build` rather than two `RUN`s also keeps them from
+# racing for the same `target/` directory, which is what a build cache mounted
+# into two concurrent stages does.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    cargo build --release --locked -p freedium-web
+    cargo build --release --locked -p freedium-web -p freedium-bot
 
 # --- the runtime -------------------------------------------------------------
 #
@@ -131,6 +143,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=build /src/target/release/freedium-web /app/freedium-web
+COPY --from=build /src/target/release/freedium-bot /app/freedium-bot
 
 # In production Caddy answers these paths itself with explicit `handle_path`
 # blocks and never forwards them here, but the router's `ServeDir` fallback
@@ -144,5 +157,9 @@ EXPOSE 7080
 # `ENTRYPOINT` plus `CMD` rather than one string, so that
 # `docker run image healthcheck` replaces the subcommand and keeps the binary —
 # which is exactly the shape the compose healthcheck needs.
+#
+# This is also the seam the bot service uses: it runs the *same image* with
+# `entrypoint: ["/app/freedium-bot"]`, which is why neither binary's name is
+# baked into the other's arguments.
 ENTRYPOINT ["/app/freedium-web"]
 CMD ["server"]

@@ -61,10 +61,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The only image the deployment actually runs. Context is the
-          # repository root — the Cargo workspace, its lockfile and the
-          # `caddy/static` copy this image serves all live above `crates/`, so
-          # the context cannot be narrowed to the crate directory.
+          # The only image the deployment actually runs — twice: it holds
+          # `freedium-web` (the server) and `freedium-bot` (the Telegram
+          # article bot), and `docker-compose.vps.yml` starts both from it,
+          # overriding the ENTRYPOINT for the second. Context is the repository
+          # root — the Cargo workspace, its lockfile and the `caddy/static` copy
+          # this image serves all live above `crates/`, so the context cannot be
+          # narrowed to the crate directory.
           - image: freedium-web
             file: crates/freedium-web/Dockerfile
             context: .

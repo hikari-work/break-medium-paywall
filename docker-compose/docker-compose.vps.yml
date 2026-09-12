@@ -111,6 +111,85 @@ services:
     restart: always
     stop_grace_period: 1m
 
+  # --- Bot Telegram ---------------------------------------------------------
+  #
+  # Artikel Medium sebagai *rich message*: kirim tautannya, bot membalas isinya
+  # dengan struktur yang sama seperti halaman. Image-nya **sama** dengan
+  # `freedium_web_rust` di atas — `crates/freedium-web/Dockerfile` membangun dua
+  # binary, dan yang ini menjalankan yang kedua.
+  freedium_bot:
+    image: ghcr.io/hikari-work/freedium-web:${FREEDIUM_TAG:-latest}
+    container_name: freedium_bot
+    hostname: freedium_bot
+
+    # Menggantikan `ENTRYPOINT ["/app/freedium-web"]` milik image. Itu sebabnya
+    # Dockerfile-nya memakai `ENTRYPOINT` + `CMD` alih-alih satu string: bentuk
+    # itu yang membuat binary kedua bisa dipilih tanpa membangun image kedua.
+    entrypoint: [ "/app/freedium-bot" ]
+    command: [ "run" ]
+
+    # **Tanpa `env_file`**, dan itu satu-satunya service di berkas ini yang
+    # begitu. Yang lain menerima seluruh `.env`; bot ini menerima dua variabel.
+    #
+    # Alasannya bukan kerapian. `env_file: ../.env` akan ikut menyerahkan
+    # `TELEGRAM_BOT_TOKEN` — token notifier alert — kepada proses ini, dan
+    # pemisahan kedua token itulah yang menjaga menyalakan bot artikel tidak
+    # menyalakan kembali banjir alert. Proses yang tidak pernah membaca sebuah
+    # rahasia tidak seharusnya memegangnya, terutama ketika satu-satunya hal
+    # yang menjaganya adalah ingatan bahwa ia tidak membacanya. `DATABASE_URL`
+    # dan `ADMIN_SECRET_KEY` ikut tidak terkirim karena alasan yang sama.
+    #
+    # Harganya: variabel bot yang ditambahkan nanti harus didaftarkan di sini
+    # juga. Empat variabelnya ada di `.env_template`, dan itu seluruh daftarnya.
+    environment:
+      # Interpolasi — dibaca dari `--env-file .env`, sama seperti
+      # `wgcf1_healthcare_service` di bawah. `:-` kosong, bukan `:?`: `.env`
+      # produksi memang boleh belum mengisinya, dan bot yang tidak punya token
+      # mengatakannya lalu keluar, bukan gagal start berulang-ulang.
+      #
+      # Token ini **berbeda** dari `TELEGRAM_BOT_TOKEN` milik notifier, dan
+      # sengaja: satu token hanya boleh punya satu pemanggil `getUpdates`, dan
+      # yang kedua akan terus kalah `409 Conflict`.
+      - "TELEGRAM_ARTICLE_BOT_TOKEN=${TELEGRAM_ARTICLE_BOT_TOKEN:-}"
+      # Literal, bukan `${VAR:-default}`, dengan alasan yang sama seperti di
+      # `freedium_web_rust`: interpolasi membaca shell operator juga, jadi satu
+      # variabel yang ter-export bisa diam-diam mengubah ke mana bot ini
+      # menembak. `FREEDIUM_BASE_URL` menunjuk ke vhost nginx host, bukan ke
+      # `freedium_web_rust:7080` — tautan yang dikirim bot ke pembaca harus bisa
+      # dibuka dari luar, dan alamat container tidak bisa.
+      - "FREEDIUM_BASE_URL=https://medium.piyann.my.id"
+
+    # **Tidak ada `ports:` sama sekali**, dan itu satu-satunya service di berkas
+    # ini yang begitu. Bot hanya butuh jalan keluar ke api.telegram.org; ia tidak
+    # menghadap siapa pun, jadi tidak ada alasan memberinya jalan masuk.
+    #
+    # **Tidak ada `depends_on:` juga.** Inilah bentuk konkret dari keputusan
+    # memanggil `/api/v1` lewat HTTP alih-alih merender dari IR di dalam proses:
+    # bot ini tidak menautkan `freedium-cache` maupun `medium-client`, jadi matinya
+    # Redis atau tunnel WARP tidak menjatuhkannya. Yang ia butuhkan cuma satu
+    # endpoint yang sudah dimonitor, dan kegagalan endpoint itu dilaporkan sebagai
+    # pesan galat ke pengguna — bukan sebagai container yang tidak mau naik.
+
+    healthcheck:
+      # `CMD`, bukan `CMD-SHELL`, karena runtime-nya distroless — sama seperti
+      # `freedium_web_rust`. Yang diperiksa hanya `getMe`: tokennya masih sah.
+      # `/api/v1` **tidak** ikut diperiksa, dan itu disengaja — lihat
+      # `crates/freedium-bot/src/main.rs`'s `healthcheck`. `freedium_autoheal`
+      # berjalan dengan `AUTOHEAL_CONTAINER_LABEL=all`, jadi denyut yang ikut
+      # memeriksa dependensi akan mengubah matinya dependensi jadi restart loop
+      # untuk bot yang sebenarnya sehat.
+      test: [ "CMD", "/app/freedium-bot", "healthcheck" ]
+      interval: 60s
+      start_period: 15s
+      timeout: 30s
+      retries: 3
+
+    mem_limit: 128m
+    restart: always
+    # Bot menahan `getUpdates` sampai 30 detik; `docker stop` harus memberinya
+    # kesempatan menyelesaikan pengiriman yang sedang berjalan.
+    stop_grace_period: 30s
+
   postgres_freedium:
     image: postgres:16.3-alpine3.20
     container_name: postgres_freedium
