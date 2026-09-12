@@ -1,6 +1,6 @@
 //! Port of CPython's `difflib.SequenceMatcher` — Ratcliff/Obershelp.
 //!
-//! Scope is exactly what Freedium needs, from `medium-parser/medium_parser/utils.py:110`:
+//! Scope is exactly what Freedium needs, from `legacy/medium-parser/medium_parser/utils.py:110`:
 //!
 //! ```python
 //! def getting_percontage_of_match(string: str, matched_string: str) -> float:

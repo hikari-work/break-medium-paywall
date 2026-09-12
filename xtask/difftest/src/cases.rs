@@ -137,7 +137,7 @@ pub fn generate(scale: f64) -> Vec<Case> {
     }
 
     // --- Group: realish -----------------------------------------------------
-    // Titles taken from tests/smokie_tests.py slugs, compared against the slug
+    // Titles taken from legacy/tests/smokie_tests.py slugs, compared against the slug
     // with dashes swapped for spaces — the shape of a real title/subtitle dedup
     // check, at realistic lengths.
     let slugs = [

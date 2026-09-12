@@ -18,7 +18,7 @@ x-freedium_web: &freedium_web
     # postgres_freedium:
     #   condition: service_healthy
   volumes:
-    - ../web:/app/web
+    - ../legacy/web:/app/web
   ports:
     - "7080:7080"
   networks:

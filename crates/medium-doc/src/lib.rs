@@ -4,6 +4,6 @@
 //! only lands the one piece that is a *blocking risk* rather than a
 //! translation job: [`difflib`], the port of CPython's
 //! `difflib.SequenceMatcher` that decides whether a paragraph duplicates the
-//! article title/subtitle (`medium-parser/medium_parser/utils.py:110`).
+//! article title/subtitle (`legacy/medium-parser/medium_parser/utils.py:110`).
 
 pub mod difflib;

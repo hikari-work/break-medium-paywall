@@ -3,6 +3,13 @@
 Status: draft untuk review
 Basis kode: commit `75d1433`
 
+> **Catatan path (2026-09-12).** Seluruh kode Python sudah dipindah ke `legacy/`.
+> Semua rujukan path di dokumen ini (`medium-parser/...`, `web/server/...`,
+> `database-lib/...`, `rl_string_helper/...`, `tests/...`) mengacu ke tata letak
+> **sebelum** pemindahan itu — tambahkan prefiks `legacy/` untuk menemukan
+> filenya sekarang. Nomor baris masih valid: `git mv` tidak mengubah isi file.
+> Di dalam container, path tetap `/app/web`, `/app/medium-parser`, dst.
+
 ---
 
 ## 0. Framing jujur dulu

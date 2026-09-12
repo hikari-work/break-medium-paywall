@@ -5,7 +5,7 @@ plan requires it be settled before any production Rust is written.
 
 ## The question
 
-`medium-parser/medium_parser/api.py:75` fetches with `curl_cffi` and
+`legacy/medium-parser/medium_parser/api.py:75` fetches with `curl_cffi` and
 `impersonate="chrome110"`. Without a browser-like TLS/HTTP2 fingerprint,
 `medium.com/_/graphql` blocks the request. Rust has no first-party equivalent.
 

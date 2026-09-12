@@ -32,8 +32,8 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-API_PY = REPO_ROOT / "medium-parser" / "medium_parser" / "api.py"
-SMOKE_TESTS = REPO_ROOT / "tests" / "smokie_tests.py"
+API_PY = REPO_ROOT / "legacy" / "medium-parser" / "medium_parser" / "api.py"
+SMOKE_TESTS = REPO_ROOT / "legacy" / "tests" / "smokie_tests.py"
 GRAPHQL_URL = "https://medium.com/_/graphql"
 
 # Transcribed from `medium_parser/api.py:36-48`. Kept in sync by hand because

@@ -8,7 +8,7 @@
 # cannot resolve. It is left inert rather than half-ported.
 #
 # The Python jobs are deliberately absent: this workflow covers only the Rust
-# workspace. `medium-parser/` keeps its own toolchain story for now.
+# workspace. `legacy/medium-parser/` keeps its own toolchain story for now.
 
 name: rust
 

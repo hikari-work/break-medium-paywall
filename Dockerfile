@@ -13,16 +13,19 @@ WORKDIR /app
 
 RUN --mount=type=cache,target=~/.cache/pip pip install wheel Cython
 
-COPY ./rl_string_helper ./rl_string_helper
+# Sumbernya ada di legacy/, tapi sengaja diletakkan di path container yang sama
+# (/app/...) supaya `api.py` yang menulis ke /app/web/sidufh.json dan bind mount
+# di docker-compose tetap valid.
+COPY ./legacy/rl_string_helper ./rl_string_helper
 RUN --mount=type=cache,target=~/.cache/pip pip3 install ./rl_string_helper
 
-COPY ./database-lib ./database-lib
+COPY ./legacy/database-lib ./database-lib
 RUN --mount=type=cache,target=~/.cache/pip pip3 install ./database-lib
 
-COPY ./medium-parser ./medium-parser
+COPY ./legacy/medium-parser ./medium-parser
 RUN --mount=type=cache,target=~/.cache/pip pip3 install ./medium-parser
 
-COPY ./web ./web
+COPY ./legacy/web ./web
 
 WORKDIR /app/web
 

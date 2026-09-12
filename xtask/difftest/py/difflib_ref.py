@@ -6,7 +6,7 @@ the CPython `difflib.SequenceMatcher(None, a, b).ratio()` result and the boolean
 decision that `medium_parser/core.py` actually makes from it.
 
 The computation is deliberately a transcription of the call site, not a
-paraphrase of it — `medium-parser/medium_parser/utils.py:110`:
+paraphrase of it — `legacy/medium-parser/medium_parser/utils.py:110`:
 
     def getting_percontage_of_match(string, matched_string) -> float:
         if string is None or matched_string is None:
