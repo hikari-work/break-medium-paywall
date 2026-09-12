@@ -1,0 +1,14 @@
+[package]
+name = "medium-doc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Medium GraphQL JSON -> Document IR. Phase 1 of the Rust rewrite; for now only the difflib port validated by SPIKE-2."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]

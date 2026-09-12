@@ -1,0 +1,5 @@
+# Pinned to `stable` rather than an exact version so a fresh clone can build
+# offline. Bump deliberately, and keep .github/workflows/rust.yml in sync.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

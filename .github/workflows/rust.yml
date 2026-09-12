@@ -1,0 +1,101 @@
+# CI for the Rust rewrite (RUST_REWRITE_PLAN §5, Fase 0: "setup workspace cargo + CI").
+#
+# NOTE ON HOSTING: the origin remote is codeberg.org, which does not read
+# `.github/workflows/`. Nothing here runs there as-is. This file is written in
+# GitHub Actions syntax so it works if the repo is mirrored to GitHub; to run it
+# on Codeberg, copy it verbatim to `.forgejo/workflows/rust.yml` — Forgejo
+# Actions is syntax-compatible and needs no edits beyond the `uses:` refs it
+# cannot resolve. It is left inert rather than half-ported.
+#
+# The Python jobs are deliberately absent: this workflow covers only the Rust
+# workspace. `medium-parser/` keeps its own toolchain story for now.
+
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same ref makes the in-flight run obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads rust-toolchain.toml (channel "stable", rustfmt + clippy).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # `-D warnings` here rather than via RUSTFLAGS so it applies to this
+      # workspace's crates, which is what lints.toml already sets to warn.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  # SPIKE-2 (§3.2): the Rust difflib port must make the same boolean decision as
+  # CPython at the `> 80` threshold. Split into its own job so a parity
+  # regression is distinguishable from a build failure at a glance.
+  difflib-parity:
+    name: SPIKE-2 difflib parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Production runs python:3.12.3 (Dockerfile:1). difflib.SequenceMatcher is
+      # the thing under test, so the reference must come from the same
+      # interpreter that runs in production — not from whatever is newest.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build harness
+        run: cargo build --release -p difftest
+
+      - name: Generate corpus
+        run: ./target/release/difftest gen-cases --out "${RUNNER_TEMP}/cases.jsonl"
+
+      # The gate is only reproducible if the corpus is. A second generation must
+      # be byte-identical; this catches a HashMap iteration order or clock that
+      # creeps into the generator and silently makes the gate unrepeatable.
+      - name: Corpus must be deterministic
+        run: |
+          ./target/release/difftest gen-cases --out "${RUNNER_TEMP}/cases-again.jsonl"
+          cmp "${RUNNER_TEMP}/cases.jsonl" "${RUNNER_TEMP}/cases-again.jsonl"
+          echo "corpus is byte-identical across runs"
+
+      - name: Generate Python reference
+        run: |
+          python3 xtask/difftest/py/difflib_ref.py \
+            --cases "${RUNNER_TEMP}/cases.jsonl" \
+            --out "${RUNNER_TEMP}/ref.jsonl"
+
+      # Non-zero on any ratio-bit, percentage-bit, or decision difference. Also
+      # fails on a degenerate corpus (all-true, all-false, or nothing landing
+      # exactly on 80.0), since a 100% match against such a corpus is no
+      # evidence at all.
+      - name: Compare
+        run: |
+          ./target/release/difftest run-difflib \
+            --cases "${RUNNER_TEMP}/cases.jsonl" \
+            --reference "${RUNNER_TEMP}/ref.jsonl"

@@ -166,3 +166,19 @@ medium_db_cache.sqlite*
 ban_post_list.db
 
 postgres/
+
+# Rust
+# `target/` is already ignored above, under the PyBuilder section.
+# Cargo.lock is intentionally NOT ignored: this workspace produces binaries, so
+# the lockfile is part of the build contract.
+
+# Build outputs of the differential test harness. The corpus is regenerated
+# byte-identically by `difftest gen-cases`, and the reference is a function of
+# it, so neither is a source file.
+/xtask/difftest/*.jsonl
+/xtask/difftest/*.log
+
+# SPIKE-1 measurement logs and the proxy pool file. These hold live WARP egress
+# endpoints; keep them out of the repository.
+/xtask/spike-impersonate/*.jsonl
+/xtask/spike-impersonate/proxies.txt

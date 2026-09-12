@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask/*"]
+# `xtask/spike-impersonate` holds the SPIKE-1 harness. It is deliberately kept
+# out of the workspace: pinning `rquest` pulls in `boring-sys`, whose BoringSSL
+# build needs a C++ toolchain and would slow every `cargo build` here for a
+# spike that cannot even run without the WARP pool. Same reasoning as
+# RUST_REWRITE_PLAN §3.4 for the edge workspace.
+exclude = ["xtask/spike-impersonate"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,15 @@
+[package]
+name = "difftest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Differential testing harness: Python reference vs Rust implementation (RUST_REWRITE_PLAN §4)."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+medium-doc = { path = "../../crates/medium-doc" }
+serde = { workspace = true }
+serde_json = { workspace = true }
