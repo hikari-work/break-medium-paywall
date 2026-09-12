@@ -35,6 +35,27 @@
 //!   dengan dua di atas: yang ini **tidak** punya penanda yang bisa dicocokkan —
 //!   lihat [`TelegramError::is_rich_message_rejection`].
 //!
+//! # Panggilan tamu: satu hasil, dan badannya bukan badan biasa
+//!
+//! [`Client::answer_guest_query`] menjawab `guest_message` — bot dipanggil di
+//! obrolan yang bukan miliknya. Tiga hal yang berbeda dari jalur lain, semuanya
+//! dari `Client.cpp`:
+//!
+//! - **Tepat satu hasil.** `process_answer_guest_query_query` membungkus satu
+//!   `InlineQueryResult` dan penerusnya `CHECK(results.size() == 1)`
+//!   (`Client.cpp:15442`). Tidak ada daftar untuk dipilih pengguna, dan tidak
+//!   ada tempat untuk meletakkan hasil kedua.
+//! - **`result` adalah JSON di dalam sebuah field**, bukan parameter tersendiri
+//!   per field seperti `sendRichMessage`. Servernya melakukan
+//!   `query->arg("result")` lalu `json_decode` (`Client.cpp:11015`), jadi yang
+//!   dikirim adalah **satu** nilai — dan seperti `rich_message`, ia dikirim
+//!   sebagai objek bersarang. Alasan dan risikonya sama; lihat bagian terakhir
+//!   berkas ini.
+//! - **Isi pesannya tetap `rich_message`.** `get_input_message_content`
+//!   memeriksa `rich_message` lebih dulu dari apa pun (`Client.cpp:10844`), jadi
+//!   artikelnya dirender dengan pohon blok yang sama persis seperti di DM —
+//!   [`guest_query_result`] cuma membungkusnya.
+//!
 //! # Satu bentuk permintaan yang belum terbukti
 //!
 //! `rich_message` dikirim sebagai **objek JSON bersarang** di dalam badan
@@ -52,6 +73,14 @@
 //! belum pernah diuji. Kalau ternyata tidak, perubahannya satu baris di
 //! [`Client::send_rich_message`]: `"rich_message": message` menjadi
 //! `"rich_message": serde_json::to_string(message)`.
+//!
+//! `answerGuestQuery` memakai bentuk yang sama untuk `result`, dan perbaikannya
+//! juga sama: satu panggilan `serde_json::to_string` di
+//! [`Client::answer_guest_query`]. Bedanya, yang ini **belum pernah diuji sama
+//! sekali** — bukan sekali pun, karena memanggilnya butuh seseorang yang benar-
+//! benar menyebut botnya di obrolan lain. Yang pertama kali gagal akan muncul
+//! di log sebagai deskripsi `400` dari Telegram, dan deskripsi itulah yang
+//! menentukan perbaikannya.
 
 use std::time::Duration;
 
@@ -80,6 +109,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// ulang di luar [`Client::send_rich_message`] — lihat
 /// [`TelegramError::is_rich_message_rejection`].
 const SEND_RICH_MESSAGE: &str = "sendRichMessage";
+
+/// Nama metode jawaban panggilan tamu.
+const ANSWER_GUEST_QUERY: &str = "answerGuestQuery";
 
 /// Bot API versi berapa yang diharapkan klien ini. Bukan yang dikirim — Bot API
 /// tidak punya parameter versi — melainkan yang diingatkan ketika `sendRichMessage`
@@ -219,6 +251,18 @@ pub struct Me {
     pub first_name: String,
     #[serde(default)]
     pub username: Option<String>,
+    /// Apakah BotFather mengizinkan bot ini dipanggil sebagai tamu.
+    ///
+    /// Dilaporkan di log saat bot mulai, dan itu satu-satunya cara membedakan
+    /// dua keadaan yang dari dalam proses ini terlihat sama persis: "panggilan
+    /// tamu tidak pernah datang" dan "panggilan tamu tidak diizinkan". Keduanya
+    /// berarti bot yang diam ketika namanya disebut di obrolan lain, dan yang
+    /// kedua cuma bisa diperbaiki di BotFather.
+    ///
+    /// `false` secara default, jadi bot terhadap server yang lebih tua dari
+    /// Bot API 10.0 tetap bisa dibaca.
+    #[serde(default)]
+    pub supports_guest_queries: bool,
 }
 
 /// Klien untuk satu token.
@@ -257,14 +301,19 @@ impl<T: Transport> Client<T> {
         offset: i64,
         timeout: Duration,
     ) -> Result<Vec<Update>, TelegramError> {
-        // `allowed_updates` dibatasi ke `message` supaya bot tidak dibangunkan
-        // oleh suntingan, poll, dan callback yang tidak diprosesnya — Telegram
-        // berhenti mengirimkannya sama sekali, jadi tidak ada yang perlu
-        // dibuang di sisi kita.
+        // `allowed_updates` dibatasi ke dua hal yang memang diproses bot ini.
+        // Telegram berhenti mengirimkan sisanya sama sekali, jadi tidak ada yang
+        // perlu dibuang di sisi kita.
+        //
+        // `guest_message` **wajib** ada di daftar ini, dan ketiadaannya adalah
+        // kegagalan diam yang paling mudah terjadi di seluruh berkas ini:
+        // panggilan tamu memang sampai ke Telegram, BotFather memang
+        // mengizinkannya, dan bot ini tidak pernah menerimanya — tanpa satu pun
+        // galat yang menyebut sebabnya.
         let body = serde_json::json!({
             "offset": offset,
             "timeout": timeout.as_secs(),
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "guest_message"],
         });
 
         self.call("getUpdates", &body, timeout + POLL_GRACE).await
@@ -282,6 +331,30 @@ impl<T: Transport> Client<T> {
         });
 
         self.call_ignoring_result(SEND_RICH_MESSAGE, &body, CALL_TIMEOUT)
+            .await
+    }
+
+    /// Menjawab panggilan tamu dengan satu hasil.
+    ///
+    /// `result` adalah nilai dari [`guest_query_result`] — dipisah supaya client
+    /// ini tidak perlu tahu bentuk `InlineQueryResult`, dan supaya isinya bisa
+    /// diperiksa sebagai nilai di test.
+    ///
+    /// Hasilnya dibuang meskipun Telegram mengembalikan `inline_message_id`:
+    /// yang bisa dilakukan dengan id itu (`editMessageText` dan sejenisnya) tidak
+    /// dilakukan bot ini, dan menyimpannya berarti memelihara keadaan yang tidak
+    /// pernah dibaca.
+    pub async fn answer_guest_query(
+        &self,
+        guest_query_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<(), TelegramError> {
+        let body = serde_json::json!({
+            "guest_query_id": guest_query_id,
+            "result": result,
+        });
+
+        self.call_ignoring_result(ANSWER_GUEST_QUERY, &body, CALL_TIMEOUT)
             .await
     }
 
@@ -343,6 +416,42 @@ impl<T: Transport> Client<T> {
 
         read(method, response)
     }
+}
+
+/// Badan satu hasil `answerGuestQuery`: sebuah artikel, dengan rich message di
+/// dalamnya.
+///
+/// # Kenapa `type` harus `"article"`
+///
+/// `type` adalah field wajib di setiap `InlineQueryResult`
+/// (`Client.cpp:11038`), dan `"article"` satu-satunya yang **mewajibkan**
+/// `input_message_content` (`Client.cpp:11043`). Tipe lain akan tetap menerima
+/// `rich_message` kalau ia dikirim, tapi dengan syarat yang lebih longgar dan
+/// dengan field wajibnya sendiri — `document` minta `mime_type`, `audio` minta
+/// `audio_url`. `"article"` adalah bentuk yang memang berarti "ini isinya,
+/// terserah mau apa", dan itu tepatnya yang dibutuhkan.
+///
+/// `title` **wajib** untuk `"article"` dan tidak bisa dihilangkan. Ia milik
+/// **pemilih hasil inline**, tempat pengguna melihat daftar sebelum memilih —
+/// dan di panggilan tamu tidak ada pemilih sama sekali. Yang dilihat penerima
+/// adalah `input_message_content`, jadi judul artikel di sini tidak menggandakan
+/// `heading` di dalam pesannya; ia hanya memenuhi syarat bentuknya.
+///
+/// `id` adalah identitas hasil, bukan post id yang harus bisa diselesaikan
+/// kembali. Post id dipakai karena ia memang unik dan sudah ada, bukan karena
+/// ada yang akan mencarinya.
+#[must_use]
+pub fn guest_query_result(
+    post_id: &str,
+    title: &str,
+    message: &InputRichMessage,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "article",
+        "id": post_id,
+        "title": title,
+        "input_message_content": { "rich_message": message },
+    })
 }
 
 /// Amplop `{"ok":…,"result":…}` — atau `{"ok":false,…}`.
@@ -545,9 +654,76 @@ mod tests {
         assert_eq!(body["timeout"], json!(30));
         assert_eq!(
             body["allowed_updates"],
-            json!(["message"]),
+            json!(["message", "guest_message"]),
             "suntingan dan callback tidak diproses; jangan minta dikirimi"
         );
+    }
+
+    /// **`guest_message` yang hilang dari `allowed_updates` adalah kegagalan
+    /// yang tidak meninggalkan jejak sama sekali.**
+    ///
+    /// Telegram berhenti mengirimkannya, tidak ada galat, dan bot yang diam
+    /// ketika dipanggil terlihat persis seperti fitur yang belum ada di
+    /// servernya. Test ini menjaga satu-satunya baris yang membedakan keduanya.
+    #[test]
+    fn guest_messages_are_asked_for_explicitly() {
+        let transport = Recorder::answering(r#"{"ok":true,"result":[]}"#);
+        futures_lite_block_on(client(transport.clone()).get_updates(0, Duration::from_secs(1)))
+            .expect("ok");
+
+        let asked = transport.body()["allowed_updates"].clone();
+        assert!(
+            asked
+                .as_array()
+                .is_some_and(|it| it.contains(&json!("guest_message"))),
+            "{asked}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Panggilan tamu
+    // ---------------------------------------------------------------------
+
+    /// Bentuk hasilnya, diperiksa sendirian — tanpa transport, karena yang
+    /// diuji adalah nilainya.
+    #[test]
+    fn a_guest_result_is_an_article_carrying_a_rich_message() {
+        let result = guest_query_result("e6047997b667", "Judul", &sample_message());
+
+        assert_eq!(result["type"], json!("article"));
+        assert_eq!(result["id"], json!("e6047997b667"));
+        assert_eq!(result["title"], json!("Judul"));
+        assert_eq!(
+            result["input_message_content"]["rich_message"]["blocks"][0],
+            json!({ "type": "paragraph", "text": "apa saja" }),
+        );
+
+        // `title` wajib untuk tipe `article`; ini yang memastikan ia tidak
+        // pernah hilang saat pemanggilnya berubah.
+        assert!(result.get("title").is_some_and(|it| it.is_string()));
+    }
+
+    #[test]
+    fn answering_a_guest_query_sends_its_id_and_its_result() {
+        let transport = Recorder::answering(r#"{"ok":true,"result":{"inline_message_id":"x"}}"#);
+
+        let result = guest_query_result("e6047997b667", "Judul", &sample_message());
+        futures_lite_block_on(client(transport.clone()).answer_guest_query("8239871239", &result))
+            .expect("ok");
+
+        let sent = transport.sent();
+        assert_eq!(
+            sent[0].url,
+            "https://api.telegram.org/bot123:ABC/answerGuestQuery"
+        );
+
+        let body = transport.body();
+        assert_eq!(body["guest_query_id"], json!("8239871239"));
+        assert_eq!(body["result"]["type"], json!("article"));
+        // Tanpa `chat_id`, dan itu bukan kelalaian: panggilan tamu memang tidak
+        // punya satu pun. Menambahkannya berarti mengirim pesan kedua ke
+        // obrolan orang.
+        assert!(body.get("chat_id").is_none(), "{body}");
     }
 
     /// **Timeout HTTP long poll harus lebih panjang dari timeout poll-nya.**

@@ -16,6 +16,21 @@
 //! di repo ini, dan karena itu token bot artikel dipisah dari token notifier —
 //! lihat [`crate::config::Config::telegram_token`].
 //!
+//! # Dua jalur masuk, satu pipeline
+//!
+//! Sebuah pesan bisa datang dari obrolan dengan bot, atau dari **panggilan
+//! tamu** — seseorang menulis `@bot` di obrolan lain. Yang membedakan keduanya
+//! cuma cara membalasnya: [`update::Source::Direct`] dibalas
+//! `sendRichMessage` ke sebuah `chat_id`, [`update::Source::Guest`] dibalas
+//! `answerGuestQuery` dengan `guest_query_id` dan tidak punya `chat_id` sama
+//! sekali.
+//!
+//! Mengambil artikelnya identik di kedua jalur, jadi [`Bot::first_article`]
+//! dipakai bersama. Yang **tidak** dibagi adalah penanganan galat, dan itu
+//! bukan kelalaian: jalur tamu tidak bisa mengirim pesan galat ke obrolan orang,
+//! jadi satu-satunya tempat untuk mengatakannya adalah hasil inline itu sendiri
+//! — lihat [`rich::one_paragraph`].
+//!
 //! # Kesalahan yang terlihat, bukan yang disembunyikan
 //!
 //! Tiga hal yang sengaja **tidak** dilakukan:
@@ -60,6 +75,21 @@ const BACKOFF_MAX: Duration = Duration::from_secs(120);
 /// Balasan ketika pengirimannya sendiri gagal, dan tidak ada yang lain yang
 /// masih bisa dilakukan.
 const SEND_FAILED: &str = "Gagal mengirim artikelnya. Coba lagi sebentar lagi.";
+
+/// Balasan ketika tautannya ada tapi tidak menuju artikel Medium.
+///
+/// Dipakai di kedua jalur — di DM sebagai pesan biasa, di panggilan tamu sebagai
+/// satu-satunya isi hasilnya.
+const NO_ARTICLE: &str = "Tidak menemukan artikel Medium di tautan itu. \
+                          Kirim tautan langsung ke artikelnya, atau id postnya.";
+
+/// Judul hasil inline untuk pesan yang **bukan** artikel.
+///
+/// `title` wajib ada di setiap hasil bertipe `article` — lihat
+/// [`telegram::guest_query_result`] — termasuk pada hasil yang isinya cuma
+/// kalimat galat. Isinya tidak pernah terlihat penerima; yang muncul adalah
+/// paragraf di dalam pesannya.
+const NOTICE_TITLE: &str = "Freedium";
 
 /// Balasan untuk `/start`, `/help`, dan pesan yang tidak memuat tautan.
 const HELP: &str = "\
@@ -152,11 +182,14 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
         config: &Config,
     ) -> Self {
         Self {
-            api: Arc::new(api::Client::new(
-                api_transport,
-                config.base_url.clone(),
-                config.request_timeout,
-            )),
+            api: Arc::new(
+                api::Client::new(
+                    api_transport,
+                    config.base_url.clone(),
+                    config.request_timeout,
+                )
+                .with_api_token(config.api_token.clone()),
+            ),
             telegram: Arc::new(telegram::Client::new(telegram_transport, token)),
             concurrency: DEFAULT_CONCURRENCY,
         }
@@ -184,6 +217,14 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
             id = me.id,
             username = me.username.as_deref().unwrap_or("(tanpa nama pengguna)"),
             base_url = config.base_url,
+            // Boolean, bukan nilainya. Pertanyaan "kenapa aku kena 429" cuma
+            // bisa dijawab kalau tier yang dipakai terlihat di log, dan tokennya
+            // sendiri tidak pernah berguna di sana.
+            trusted = config.api_token.is_some(),
+            // `false` di sini bukan kegagalan boot: bot tetap bekerja di DM,
+            // dan yang hilang cuma jalur tamunya. Yang penting adalah ia
+            // terlihat, karena tidak ada galat yang akan menyebutkannya.
+            guest = me.supports_guest_queries,
             "bot siap"
         );
 
@@ -236,7 +277,7 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
                 // yang sama.
                 offset = update.update_id + 1;
 
-                let Some(message) = update.message else {
+                let Some(message) = update.into_incoming() else {
                     continue;
                 };
 
@@ -261,6 +302,16 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
     /// tidak punya siapa-siapa untuk melaporkannya, dan setiap kegagalan sudah
     /// jadi log atau pesan kepada pengguna di sini.
     async fn handle(&self, message: &Message) {
+        match message.source() {
+            // Obrolan kita sendiri: balasannya pesan biasa, dan pesan galat pun
+            // boleh dikirim ke sana.
+            update::Source::Direct => self.handle_direct(message).await,
+            update::Source::Guest(query_id) => self.handle_guest(message, query_id).await,
+        }
+    }
+
+    /// Pesan di obrolan bot — DM, atau grup yang menyebutnya.
+    async fn handle_direct(&self, message: &Message) {
         let chat_id = message.chat.id;
         let candidates = update::url_candidates(message);
 
@@ -277,15 +328,10 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
             return;
         }
 
-        let page_url = match self.first_article(&candidates).await {
+        let (post_id, post) = match self.first_article(&candidates).await {
             Ok(found) => found,
             Err(NotFound::NoCandidate) => {
-                self.reply(
-                    chat_id,
-                    "Tidak menemukan artikel Medium di tautan itu. Kirim tautan \
-                     langsung ke artikelnya, atau id postnya.",
-                )
-                .await;
+                self.reply(chat_id, NO_ARTICLE).await;
                 return;
             }
             Err(NotFound::Api(error)) => {
@@ -296,14 +342,124 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
             }
         };
 
-        let (post_id, post) = page_url;
-        let rendered = rich::rich_message(&post, self.api.base_url());
+        let rendered = self.render(&post_id, &post);
+
+        self.deliver(chat_id, &post_id, &rendered).await;
+    }
+
+    /// Panggilan tamu — bot disebut di obrolan yang bukan miliknya.
+    ///
+    /// # Kenapa tidak ada balasan ketika pesannya tidak memuat tautan
+    ///
+    /// Karena memang tidak ada tempat untuk meletakkannya. Panggilan tamu tanpa
+    /// hasil berarti tidak ada pesan yang muncul, dan itu juga persis yang
+    /// terjadi kalau bot diam — jadi menambahkan "kirim tautan Medium" ke sini
+    /// hanya akan membuat bot mengomentari obrolan orang setiap kali namanya
+    /// disebut, yang justru alasan ia tidak membalas pesan tanpa tautan di DM.
+    ///
+    /// Yang **tidak** boleh diam adalah kegagalan setelah tautannya ada:
+    /// pengguna sudah meminta sesuatu, dan tidak ada apa pun di layarnya yang
+    /// memberi tahu bahwa permintaannya gagal.
+    async fn handle_guest(&self, message: &Message, query_id: &str) {
+        let candidates = update::url_candidates(message);
+
+        if candidates.is_empty() {
+            tracing::debug!("panggilan tamu tanpa tautan; tidak ada yang dijawab");
+            return;
+        }
+
+        let (post_id, title, rendered) = match self.first_article(&candidates).await {
+            Ok((post_id, post)) => {
+                let title = post.meta.title.clone();
+                let rendered = self.render(&post_id, &post);
+                (post_id, title, rendered)
+            }
+            Err(NotFound::NoCandidate) => {
+                self.answer_guest(
+                    query_id,
+                    "tamu",
+                    NOTICE_TITLE,
+                    rich::one_paragraph(NO_ARTICLE),
+                )
+                .await;
+                return;
+            }
+            Err(NotFound::Api(error)) => {
+                tracing::warn!("gagal mengambil artikel: {error}");
+                self.answer_guest(
+                    query_id,
+                    "tamu",
+                    NOTICE_TITLE,
+                    rich::one_paragraph(&format!("Gagal mengambil artikelnya: {error}")),
+                )
+                .await;
+                return;
+            }
+        };
+
+        self.answer_guest(query_id, &post_id, &title, rendered)
+            .await;
+    }
+
+    /// Artikel jadi pesan, dengan pencatatan pemotongan yang sama di kedua jalur.
+    fn render(&self, post_id: &str, post: &PostDto) -> rich::Rendered {
+        let rendered = rich::rich_message(post, self.api.base_url());
 
         if rendered.truncated {
             tracing::info!(post_id, "artikel dipotong supaya muat");
         }
 
-        self.deliver(chat_id, &post_id, &rendered).await;
+        rendered
+    }
+
+    /// Mengirim satu hasil untuk sebuah panggilan tamu.
+    ///
+    /// Sekali coba, lalu sekali lagi kalau Telegram meminta menunggu — aturan
+    /// yang sama dengan [`Bot::deliver`], dan sengaja tidak disatukan dengan
+    /// helper generik: satu-satunya yang dibagi keduanya adalah bentuk loop-nya,
+    /// sedangkan yang dikirim dan cara mencatatnya berbeda.
+    async fn answer_guest(
+        &self,
+        query_id: &str,
+        post_id: &str,
+        title: &str,
+        rendered: rich::Rendered,
+    ) {
+        let result = telegram::guest_query_result(post_id, title, &rendered.message);
+        let mut attempt = 0;
+
+        loop {
+            match self.telegram.answer_guest_query(query_id, &result).await {
+                Ok(()) => {
+                    tracing::info!(
+                        post_id,
+                        blocks = rendered.message.blocks.len(),
+                        truncated = rendered.truncated,
+                        "artikel terjawab sebagai panggilan tamu"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    if let Some(wait) = error.retry_after()
+                        && attempt == 0
+                    {
+                        attempt += 1;
+                        tracing::warn!("dibatasi Telegram; menunggu {wait:?}");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+
+                    // Tidak ada `reply`: `guest_query_id` bukan sebuah obrolan,
+                    // dan mengirim pesan ke `chat_id` di sini berarti menambah
+                    // satu pesan yang tidak diminta siapa pun ke obrolan orang.
+                    tracing::warn!(post_id, "gagal menjawab panggilan tamu: {error}");
+                    if let Some(advice) = error.advice() {
+                        tracing::error!("{advice}");
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Artikel pertama yang berhasil diselesaikan dari sekumpulan kandidat.
@@ -331,6 +487,14 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
     }
 
     /// Mengirim rich message, dengan satu percobaan ulang untuk pembatasan laju.
+    ///
+    /// # Kenapa keberhasilannya dicatat
+    ///
+    /// Sampai suatu saat, satu-satunya jejak sebuah artikel terkirim adalah
+    /// ketiadaan galat. Itu membuat percobaan pertama tidak bisa dibedakan dari
+    /// bot yang tidak pernah menerima pesannya — dua keadaan yang sangat berbeda,
+    /// dan yang satu membuktikan seluruh jalurnya. Satu baris per artikel adalah
+    /// harga yang pantas untuk bisa menjawab "apakah tadi terkirim".
     async fn deliver(&self, chat_id: i64, post_id: &str, rendered: &rich::Rendered) {
         let mut attempt = 0;
 
@@ -340,7 +504,16 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
                 .send_rich_message(chat_id, &rendered.message)
                 .await
             {
-                Ok(()) => return,
+                Ok(()) => {
+                    tracing::info!(
+                        post_id,
+                        chat_id,
+                        blocks = rendered.message.blocks.len(),
+                        truncated = rendered.truncated,
+                        "artikel terkirim"
+                    );
+                    return;
+                }
                 Err(error) => {
                     if let Some(wait) = error.retry_after()
                         && attempt == 0

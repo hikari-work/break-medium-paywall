@@ -19,12 +19,37 @@
 //! tanpa soket, dan pertanyaan "apakah jalur lokal benar-benar melewati
 //! jaringan" jadi bisa dijawab.
 //!
-//! # Yang tidak dikirim: `X-API-TOKEN`
+//! # `X-API-TOKEN`, dan kenapa keputusan sebelumnya dibalik
 //!
-//! `/api/v1` terbuka untuk pembacaan; token hanya menaikkan jatah laju. Bot ini
-//! dijalankan oleh orang yang sama dengan yang menjalankan servernya, dan
-//! menyimpan token di sebuah variabel lingkungan untuk membeli kuota yang tidak
-//! pernah habis hanya menambah satu rahasia untuk dijaga.
+//! Sampai satu titik, klien ini **sengaja tidak pernah** mengirim header itu.
+//! Alasannya waktu itu: `/api/v1` terbuka untuk pembacaan, token cuma menaikkan
+//! jatah laju, dan menyimpan satu rahasia untuk membeli kuota yang tidak pernah
+//! habis tidak sepadan.
+//!
+//! Yang membuat hitungannya berubah bukan kuota yang lebih besar, melainkan
+//! **burst**-nya. Tier anonim punya `miss` 3 per menit dengan burst **1**
+//! (`freedium-web/src/api/limit.rs`), dan satu artikel menghabiskan dua
+//! permintaan miss — `resolve` lalu `posts`. Artinya orang yang mengirim dua
+//! tautan baru dalam dua puluh detik kena `429` pada tautan kedua. Itu bukan
+//! pembatasan yang masuk akal untuk satu orang yang mengirim tautan ke dirinya
+//! sendiri, dan justru itulah pemakaian bot ini.
+//!
+//! Tier tepercaya tidak menaikkan anggaran fetch Medium sedikit pun — kuota
+//! `fetch` proses-global tetap sama dan tetap dikenakan ke semua orang. Ia hanya
+//! memindahkan biaya melayani satu klien dari "pemindai internet" ke "pemilik
+//! server". Karena itu kuota anonim tetap seperti semula.
+//!
+//! # Tiga hal yang dijaga di sini
+//!
+//! - **`None` berarti header tidak dikirim**, bukan header kosong. Header kosong
+//!   adalah klaim, dan server menjawabnya `401` — lihat `token_tier` di sana.
+//!   Klien yang menurunkannya diam-diam ke tier anonim akan menyembunyikan token
+//!   yang salah sampai hari jatahnya benar-benar habis.
+//! - **Tokennya tidak pernah masuk log.** Satu-satunya tempat ia muncul adalah
+//!   daftar header permintaan. Log `debug!` di [`Client::get`] mencetak URL-nya
+//!   saja.
+//! - **Nama variabelnya sama dengan milik server** (`API_TOKEN`), supaya satu
+//!   rahasia tidak pernah punya dua nilai. Lihat [`crate::config::Config`].
 
 use std::time::Duration;
 
@@ -44,6 +69,15 @@ const POST_ID_LEN: usize = 12;
 /// satu-satunya cara membedakan trafik bot dari trafik peramban ketika ada yang
 /// perlu dipertanggungjawabkan.
 const USER_AGENT: &str = concat!("freedium-bot/", env!("CARGO_PKG_VERSION"));
+
+/// Nama header tier tepercaya.
+///
+/// Ditulis di sini alih-alih diimpor dari `freedium-web`: bot ini tidak
+/// menautkan crate itu — bot sengaja hanya bicara lewat HTTP — dan satu string
+/// yang harus cocok adalah hal yang paling murah untuk diduplikasi. Yang
+/// menjaganya tetap cocok bukan kompilator melainkan test di bawah, yang
+/// memeriksa header yang benar-benar disusun.
+const API_TOKEN_HEADER: &str = "X-API-TOKEN";
 
 /// Kenapa sebuah panggilan API gagal.
 #[derive(Debug, Error)]
@@ -106,6 +140,8 @@ pub struct Client<T: Transport> {
     transport: T,
     base_url: String,
     timeout: Duration,
+    /// `None` berarti header tidak dikirim sama sekali. Lihat catatan modul.
+    api_token: Option<String>,
 }
 
 /// Klien yang benar-benar dijalankan bot.
@@ -118,7 +154,40 @@ impl<T: Transport> Client<T> {
             transport,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             timeout,
+            api_token: None,
         }
+    }
+
+    /// Mengirim `X-API-TOKEN` pada setiap permintaan berikutnya.
+    ///
+    /// Dipisah dari [`Client::new`] karena kredensial ini opsional dan ortogonal:
+    /// tiga argumen posisional sudah cukup banyak, dan menambahkan `None` di
+    /// setiap pemanggil yang tidak peduli akan menyembunyikan bahwa ia memang
+    /// opsional. Dipanggil sekali di [`crate::bot::Bot::with_transports`].
+    ///
+    /// `None` berarti "tidak ada token", sama seperti [`crate::config::Config`]:
+    /// header tidak dikirim sama sekali, bukan dikirim kosong.
+    #[must_use]
+    pub fn with_api_token(mut self, token: Option<String>) -> Self {
+        self.api_token = token;
+        self
+    }
+
+    /// Header yang dikirim pada setiap permintaan.
+    ///
+    /// Satu tempat, supaya "apakah token ikut" bisa diperiksa sebagai nilai,
+    /// bukan dengan membaca ulang badan [`Client::get`].
+    fn headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![("User-Agent".to_string(), USER_AGENT.to_string())];
+
+        // Header kosong adalah klaim token yang salah, bukan "tanpa token" —
+        // itu jawaban `401` dari server, bukan tier anonim. Karena itu yang
+        // dikirim hanya token yang benar-benar ada.
+        if let Some(token) = &self.api_token {
+            headers.push((API_TOKEN_HEADER.to_string(), token.clone()));
+        }
+
+        headers
     }
 
     /// Halaman yang dirender bot ini, untuk artikel yang dipotong.
@@ -190,7 +259,7 @@ impl<T: Transport> Client<T> {
             .send(TransportRequest {
                 url,
                 method: Method::Get,
-                headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
+                headers: self.headers(),
                 body: Vec::new(),
                 // `None`, selalu. Ini host kita sendiri; merutekannya lewat
                 // kumpulan exit WARP akan menghabiskan satu exit untuk trafik
@@ -286,6 +355,11 @@ mod tests {
 
     fn client(transport: Recorder) -> Client<Recorder> {
         Client::new(transport, "https://contoh.test/", Duration::from_secs(5))
+    }
+
+    /// Header yang dikirim, apa adanya.
+    fn headers(request: &TransportRequest) -> Vec<(String, String)> {
+        request.headers.clone()
     }
 
     // ---------------------------------------------------------------------
@@ -466,6 +540,56 @@ mod tests {
             .expect_err("transportnya memang rusak");
 
         assert!(matches!(error, ApiError::Transport(_)), "{error:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Tier tepercaya
+    // ---------------------------------------------------------------------
+
+    /// Tanpa token, header itu tidak ada — **bukan** ada tapi kosong.
+    ///
+    /// Bedanya bukan gaya: server memperlakukan header kosong sebagai klaim
+    /// token yang salah dan menjawabnya `401` (`token_tier` di
+    /// `freedium-web/src/api/limit.rs`), jadi klien yang mengirim
+    /// `X-API-TOKEN:` yang kosong akan berhenti bekerja sama sekali, bukan
+    /// mundur ke tier anonim.
+    #[tokio::test]
+    async fn without_a_token_the_header_is_absent_rather_than_empty() {
+        let transport = Recorder::answering(200, "{}");
+        let _ = client(transport.clone()).post("e6047997b667").await;
+
+        let sent = transport.sent();
+        let names: Vec<&str> = sent[0]
+            .headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["User-Agent"], "hanya User-Agent yang dikirim");
+    }
+
+    #[tokio::test]
+    async fn a_configured_token_is_sent_on_every_request() {
+        let transport = Recorder::answering(
+            200,
+            r#"{"schema_version":1,"post_id":"e6047997b667","resolved_url":"https://medium.com/p/e6047997b667"}"#,
+        );
+
+        let client = client(transport.clone()).with_api_token(Some("rahasia".to_string()));
+
+        let _ = client.resolve("https://medium.com/@x/y").await;
+        let _ = client.post("e6047997b667").await;
+
+        let sent = transport.sent();
+        assert_eq!(sent.len(), 2, "satu resolve, satu post");
+        for request in &sent {
+            let headers = headers(request);
+            assert!(
+                headers.contains(&("X-API-TOKEN".to_string(), "rahasia".to_string())),
+                "{:?}",
+                headers
+            );
+        }
     }
 
     #[test]

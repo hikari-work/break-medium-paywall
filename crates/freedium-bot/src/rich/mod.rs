@@ -109,6 +109,29 @@ pub fn rich_message(post: &PostDto, base_url: &str) -> Rendered {
     }
 }
 
+/// Pesan satu paragraf, tanpa apa pun yang lain.
+///
+/// Dipakai [`crate::bot`] untuk menjawab panggilan tamu yang gagal: panggilan
+/// tamu **tidak punya `chat_id`**, jadi satu-satunya cara mengatakan "artikelnya
+/// tidak bisa diambil" adalah lewat hasil inline itu sendiri. Karena itu
+/// isinya harus selalu bisa dirender — satu paragraf teks polos, tanpa tautan,
+/// tanpa media, dan tanpa blok kedua yang bisa membuat anggarannya lewat.
+///
+/// Teksnya datang dari dua tempat yang tidak dikendalikan di sini: kalimat
+/// [`crate::bot`] sendiri, dan deskripsi galat dari Telegram atau `/api/v1`.
+/// Yang kedua bisa panjang, tapi tidak bisa melewati [`budget::MAX_BYTES`] —
+/// dan kalau suatu hari bisa, yang salah adalah tempat yang membiarkannya
+/// sepanjang itu.
+#[must_use]
+pub fn one_paragraph(text: &str) -> Rendered {
+    Rendered {
+        message: InputRichMessage::from_blocks(vec![InputRichBlock::Paragraph {
+            text: RichText::plain(text),
+        }]),
+        truncated: false,
+    }
+}
+
 /// Satu blok untuk post yang tidak menghasilkan apa-apa.
 ///
 /// Telegram menolak `{"blocks":[]}` dengan *"Rich message must be non-empty"* —

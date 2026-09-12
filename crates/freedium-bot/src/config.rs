@@ -24,6 +24,18 @@
 //! menolak jalan tanpa token berarti alat itu tidak bisa dipakai sebelum ada
 //! token. Yang menolak adalah `run`, di [`crate::bot`], dan di sana token memang
 //! satu-satunya hal yang membuat loop-nya berarti.
+//!
+//! # Dua token, dua kegunaan, dan satu nama yang dipakai bersama
+//!
+//! [`Config::api_token`] adalah `API_TOKEN` — **nama yang sama** dengan yang
+//! dibaca `freedium-web/src/config.rs`, dan itu disengaja: satu rahasia, satu
+//! baris di `.env`, dibaca kedua sisi. Memberinya nama sendiri di sini
+//! (`FREEDIUM_API_TOKEN`) berarti dua nilai yang harus diisi sama, dan satu
+//! kesempatan untuk membuat keduanya berbeda tanpa ada yang memberi tahu.
+//!
+//! `None` berarti header tidak dikirim sama sekali, bukan header kosong. Server
+//! memperlakukan token kosong sebagai "tier tidak ada", dan mengirim
+//! `X-API-TOKEN: ` akan ditolak `401` oleh server yang mengaktifkannya.
 
 use std::time::Duration;
 
@@ -85,6 +97,14 @@ pub struct Config {
     /// dua pemanggil `getUpdates` dengan token yang sama akan saling menendang
     /// dengan `409 Conflict`.
     pub telegram_token: Option<String>,
+    /// `API_TOKEN` — identitas klien tepercaya di `/api/v1`. Lihat catatan modul
+    /// soal kenapa namanya sama dengan milik server.
+    ///
+    /// Tanpa ini bot memakai bucket anonim: 3 permintaan cache-miss per menit
+    /// dengan **burst 1**, yang berarti artikel kedua yang dikirim berurutan
+    /// dalam dua puluh detik ditolak `429`. Itu bukan pembatasan yang masuk akal
+    /// untuk satu orang yang mengirim tautan ke dirinya sendiri.
+    pub api_token: Option<String>,
     pub poll_timeout: Duration,
     pub request_timeout: Duration,
 }
@@ -110,6 +130,7 @@ impl Config {
             // dan Cloudflare meneruskan `//` apa adanya, jadi itu 404.
             base_url: base_url.trim_end_matches('/').to_string(),
             telegram_token: non_empty(lookup("TELEGRAM_ARTICLE_BOT_TOKEN")),
+            api_token: non_empty(lookup("API_TOKEN")),
             poll_timeout: seconds(
                 lookup("BOT_POLL_TIMEOUT_SECONDS"),
                 DEFAULT_POLL_TIMEOUT,
@@ -174,8 +195,24 @@ mod tests {
 
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.telegram_token, None);
+        assert_eq!(config.api_token, None);
         assert_eq!(config.poll_timeout, DEFAULT_POLL_TIMEOUT);
         assert_eq!(config.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    /// Nama variabelnya harus sama dengan yang dibaca `freedium-web`, karena
+    /// keduanya adalah satu rahasia yang sama. Test ini gagal kalau salah satu
+    /// sisi mengganti namanya sendiri.
+    #[test]
+    fn the_api_token_is_the_same_variable_the_server_reads() {
+        let config = config_from(&[("API_TOKEN", "rahasia")]).expect("sah");
+        assert_eq!(config.api_token.as_deref(), Some("rahasia"));
+
+        let kosong = config_from(&[("API_TOKEN", "  ")]).expect("sah");
+        assert_eq!(
+            kosong.api_token, None,
+            "token kosong berarti header tidak dikirim, bukan header kosong"
+        );
     }
 
     /// **Token bot artikel tidak boleh bisa tertukar dengan token notifier.**

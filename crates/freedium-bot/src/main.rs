@@ -1,11 +1,14 @@
 //! Binary `freedium-bot`.
 //!
-//! # Tiga subcommand, dan yang ketiga adalah alat verifikasinya
+//! # Empat subcommand, dan dua di antaranya adalah alat verifikasinya
 //!
 //! `run` adalah botnya. `render` mencetak JSON `InputRichMessage` untuk sebuah
 //! URL **tanpa token Telegram** — dan itulah yang membuat seluruh pekerjaan ini
 //! bisa diperiksa tanpa mata manusia melihat layar ponsel: JSON-nya dibaca
 //! berdampingan dengan halaman web untuk artikel yang sama, dan bedanya terlihat.
+//! `guest` mencetak badan `answerGuestQuery` untuk URL yang sama, karena jalur
+//! tamu tidak bisa diperiksa dengan cara lain: memanggilnya sungguhan butuh
+//! seseorang yang menyebut botnya di obrolan lain.
 //! `healthcheck` adalah denyut yang dipakai compose; lihat
 //! [`healthcheck`] soal kenapa ia tidak memeriksa API.
 //!
@@ -33,6 +36,7 @@ Freedium Telegram bot
 Usage:
   freedium-bot run             Long-poll Telegram until signalled
   freedium-bot render <url>    Print the rich message JSON for a URL
+  freedium-bot guest <url>     Print the answerGuestQuery body for a URL
   freedium-bot healthcheck     Ask Telegram whether this bot is up
 
 Options:
@@ -51,7 +55,8 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("run") => run().await,
-        Some("render") => render(args.get(1).map(String::as_str)).await,
+        Some("render") => article(args.get(1).map(String::as_str), Envelope::Send).await,
+        Some("guest") => article(args.get(1).map(String::as_str), Envelope::Guest).await,
         Some("healthcheck") => healthcheck().await,
         Some(other) => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
@@ -112,20 +117,39 @@ async fn run() -> ExitCode {
     }
 }
 
+/// Amplop mana yang dicetak [`article`].
+///
+/// Selisihnya cuma pembungkus: pesannya — dan karena itu seluruh konversi
+/// Medium-nya — sama persis di kedua jalur. Itu memang yang ingin ditunjukkan
+/// berpasangan.
+#[derive(Clone, Copy)]
+enum Envelope {
+    /// Badan `sendRichMessage`.
+    Send,
+    /// Badan `answerGuestQuery`, dengan id panggilan karangan.
+    Guest,
+}
+
 /// Mencetak JSON `InputRichMessage` untuk sebuah URL.
 ///
 /// Tanpa token Telegram, dan itu disengaja: ini jalur verifikasi yang harus bisa
 /// dipakai sebelum ada bot untuk diuji. Yang dibutuhkannya cuma API-nya sendiri
 /// — dan API itu `/api/v1`, yang sudah live.
-async fn render(url: Option<&str>) -> ExitCode {
+///
+/// `API_TOKEN` **ikut** kalau ada, dan itu berbeda dari token Telegram: nilainya
+/// hanya menaikkan tier laju `/api/v1`, jadi `render` yang dijalankan berkali-kali
+/// berturut-turut saat membandingkan JSON dengan halaman web tidak menabrak
+/// jatahnya sendiri.
+async fn article(url: Option<&str>, envelope: Envelope) -> ExitCode {
     let Some(url) = url else {
-        eprintln!("render butuh sebuah URL\n\n{USAGE}");
+        eprintln!("perintah ini butuh sebuah URL\n\n{USAGE}");
         return ExitCode::from(2);
     };
 
     let config = config_or_exit();
     let transport = ReqwestTransport::new().expect("klien HTTPS langsung selalu bisa dibangun");
-    let client = api::Client::new(transport, config.base_url.clone(), config.request_timeout);
+    let client = api::Client::new(transport, config.base_url.clone(), config.request_timeout)
+        .with_api_token(config.api_token.clone());
 
     let post_id = match client.resolve(url).await {
         Ok(post_id) => post_id,
@@ -152,7 +176,23 @@ async fn render(url: Option<&str>) -> ExitCode {
         rendered.truncated
     );
 
-    match serde_json::to_string_pretty(&serde_json::json!({ "rich_message": rendered.message })) {
+    let body = match envelope {
+        Envelope::Send => serde_json::json!({ "rich_message": rendered.message }),
+        // Id panggilannya karangan dan jelas begitu: yang bisa diperiksa dari
+        // keluaran ini adalah bentuk `result`-nya, bukan apakah Telegram mau
+        // menerimanya. Yang menjawab pertanyaan kedua cuma satu kali panggilan
+        // sungguhan.
+        Envelope::Guest => serde_json::json!({
+            "guest_query_id": "0",
+            "result": telegram::guest_query_result(
+                &post_id,
+                &post.meta.title,
+                &rendered.message,
+            ),
+        }),
+    };
+
+    match serde_json::to_string_pretty(&body) {
         Ok(json) => {
             println!("{json}");
             ExitCode::SUCCESS

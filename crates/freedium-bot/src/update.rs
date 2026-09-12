@@ -15,20 +15,71 @@
 //!
 //! Satuan yang sama muncul di [`crate::rich::budget`], dan itu bukan kebetulan:
 //! Telegram menghitung teksnya dengan satu cara di seluruh API-nya.
+//!
+//! # Dua jalur masuk, dan kenapa yang kedua tidak bisa ditambahkan di Telegram
+//!
+//! Sebuah pesan bisa datang dari obrolan dengan bot, atau dari **panggilan
+//! tamu** — seseorang menulis `@bot` di obrolan yang bukan milik bot, dan bot
+//! menjawab sekali di sana. Yang kedua adalah fitur Telegram (Bot API 10.0),
+//! bukan sesuatu yang bisa dinyalakan dari sisi klien: benderanya ada di
+//! BotFather, dan `getMe` melaporkannya sebagai `supports_guest_queries`.
+//!
+//! Yang **bisa** salah dari sisi kita cuma satu: `allowed_updates`. Tanpa
+//! `guest_message` di daftar itu, Telegram berhenti mengirimkannya sama sekali —
+//! tidak ada galat, tidak ada log, hanya bot yang diam ketika dipanggil. Itu
+//! kegagalan yang terlihat persis seperti "fitur ini belum ada di server", dan
+//! karena itu [`crate::telegram::Client::get_updates`] menyebut keduanya.
 
 use serde::Deserialize;
 
+/// Dari mana sebuah pesan datang, dan lewat apa balasannya.
+///
+/// Perbedaan ini bukan detail: pesan langsung dibalas `sendRichMessage` ke
+/// sebuah `chat_id`, sedangkan panggilan tamu dibalas `answerGuestQuery` dengan
+/// sebuah `guest_query_id` dan **tidak punya `chat_id` sama sekali**. Menjawab
+/// yang kedua dengan cara pertama berarti mengirim pesan kedua ke obrolan orang
+/// — persis yang tidak diminta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source<'a> {
+    /// Obrolan dengan bot, atau grup yang menyebut botnya.
+    Direct,
+    /// Dipanggil di obrolan yang bukan milik bot. Isinya `guest_query_id`.
+    Guest(&'a str),
+}
+
 /// Satu pembaruan dari `getUpdates`.
 ///
-/// Hanya `message` yang dideklarasikan. Telegram mengirim jenis pembaruan lain
-/// (edit, callback, poll), dan `deny_unknown_fields` tidak dipakai justru supaya
-/// semuanya bisa diabaikan dengan tenang — bot ini tidak punya urusan dengan
-/// pesan yang sudah diedit.
+/// `message` dan `guest_message` dideklarasikan; sisanya tidak. Telegram mengirim
+/// jenis pembaruan lain (edit, callback, poll), dan `deny_unknown_fields` tidak
+/// dipakai justru supaya semuanya bisa diabaikan dengan tenang — bot ini tidak
+/// punya urusan dengan pesan yang sudah diedit.
+///
+/// `guest_message` isinya bentuk [`Message`] yang sama, dengan satu field
+/// tambahan. Itu memang begitu di servernya: `Client.cpp:19503` menyalurkannya
+/// lewat `add_message_update` yang sama dengan pesan biasa.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Update {
     pub update_id: i64,
     #[serde(default)]
     pub message: Option<Message>,
+    #[serde(default)]
+    pub guest_message: Option<Message>,
+}
+
+impl Update {
+    /// Pesan yang perlu ditangani, dari jalur mana pun.
+    ///
+    /// Mengambil alih alih meminjam: pemanggilnya memang tidak butuh
+    /// pembaruan ini lagi setelah pesannya diambil, dan meminjam berarti satu
+    /// salinan [`Message`] per pesan hanya supaya bisa masuk `tokio::spawn`.
+    ///
+    /// `message` lebih dulu kalau keduanya ada. Keduanya sekaligus tidak
+    /// seharusnya terjadi, dan memilih satu dengan urutan yang tetap lebih baik
+    /// daripada memproses keduanya dan mengirim artikel dua kali.
+    #[must_use]
+    pub fn into_incoming(self) -> Option<Message> {
+        self.message.or(self.guest_message)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +93,26 @@ pub struct Message {
     /// [`url_candidates`] bisa mengandalkan urutannya.
     #[serde(default)]
     pub entities: Vec<MessageEntity>,
+    /// Hadir **hanya** pada panggilan tamu, dan itulah satu-satunya penanda
+    /// bahwa pesan ini bukan pesan biasa.
+    ///
+    /// Sebuah string, bukan angka, meskipun isinya angka: server menulisnya
+    /// dengan `td::to_string` (`Client.cpp:4847`) dan membacanya kembali dengan
+    /// `td::to_integer` (`Client.cpp:15434`). Menyimpannya apa adanya berarti
+    /// bot ini tidak perlu tahu bahwa ia sebenarnya sebuah bilangan.
+    #[serde(default)]
+    pub guest_query_id: Option<String>,
+}
+
+impl Message {
+    /// Lewat apa pesan ini harus dibalas.
+    #[must_use]
+    pub fn source(&self) -> Source<'_> {
+        match self.guest_query_id.as_deref() {
+            Some(query_id) => Source::Guest(query_id),
+            None => Source::Direct,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,6 +275,7 @@ mod tests {
             chat: Chat { id: 42 },
             text: Some(text.to_string()),
             entities,
+            guest_query_id: None,
         }
     }
 
@@ -427,6 +499,64 @@ mod tests {
                 .expect("field yang tidak dikenal diabaikan");
 
         assert!(update.message.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Panggilan tamu
+    // ---------------------------------------------------------------------
+
+    /// Bentuk `guest_message`, dipersempit ke field yang dipakai.
+    ///
+    /// `guest_query_id` ditulis sebagai **string** meskipun isinya angka, dan
+    /// itu bukan pilihan kita: server menuliskannya dengan `td::to_string`
+    /// (`Client.cpp:4847`). Membacanya sebagai `i64` akan menggagalkan
+    /// pembacaan seluruh batch, bukan cuma satu pembaruan.
+    #[test]
+    fn a_guest_message_deserialises_with_its_query_id() {
+        let raw = r#"{
+            "update_id": 900,
+            "guest_message": {
+                "message_id": 12,
+                "date": 1789000000,
+                "chat": { "id": -1009876543210, "type": "supergroup" },
+                "from": { "id": 7, "is_bot": false, "first_name": "A" },
+                "guest_query_id": "8239871239",
+                "text": "https://medium.com/@x/y",
+                "entities": [ { "type": "url", "offset": 0, "length": 23 } ]
+            }
+        }"#;
+
+        let update: Update = serde_json::from_str(raw).expect("bentuk sungguhan bisa dibaca");
+        assert!(update.message.is_none(), "bukan pesan biasa");
+
+        let message = update.into_incoming().expect("ada pesannya");
+        assert_eq!(message.source(), Source::Guest("8239871239"));
+        assert_eq!(url_candidates(&message), ["https://medium.com/@x/y"]);
+    }
+
+    /// Tanpa `guest_query_id`, sebuah pesan adalah pesan biasa — dan jalur
+    /// itulah yang menentukan [`Source::Direct`], bukan ada tidaknya
+    /// `guest_message` di amplopnya.
+    #[test]
+    fn a_message_without_a_query_id_is_direct() {
+        let ordinary = message("halo", Vec::new());
+        assert_eq!(ordinary.source(), Source::Direct);
+
+        // Bahkan di dalam `guest_message`: yang menentukan adalah fieldnya,
+        // karena itu satu-satunya yang memberi tahu ke mana balasannya pergi.
+        let without =
+            serde_json::from_str::<Message>(r#"{"message_id":1,"chat":{"id":42}}"#).expect("sah");
+        assert_eq!(without.source(), Source::Direct);
+    }
+
+    /// Pembaruan tanpa pesan sama sekali tetap harus terlewat dengan tenang —
+    /// termasuk bentuk yang cuma punya `guest_message` yang bukan milik kita.
+    #[test]
+    fn an_update_carrying_neither_kind_of_message_has_nothing_incoming() {
+        let update: Update = serde_json::from_str(r#"{"update_id":1,"callback_query":{"id":"x"}}"#)
+            .expect("field yang tidak dikenal diabaikan");
+
+        assert!(update.into_incoming().is_none());
     }
 
     #[test]

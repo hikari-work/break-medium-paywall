@@ -140,7 +140,7 @@ services:
     # dan `ADMIN_SECRET_KEY` ikut tidak terkirim karena alasan yang sama.
     #
     # Harganya: variabel bot yang ditambahkan nanti harus didaftarkan di sini
-    # juga. Empat variabelnya ada di `.env_template`, dan itu seluruh daftarnya.
+    # juga. Lima variabelnya ada di `.env_template`, dan itu seluruh daftarnya.
     environment:
       # Interpolasi — dibaca dari `--env-file .env`, sama seperti
       # `wgcf1_healthcare_service` di bawah. `:-` kosong, bukan `:?`: `.env`
@@ -151,6 +151,21 @@ services:
       # sengaja: satu token hanya boleh punya satu pemanggil `getUpdates`, dan
       # yang kedua akan terus kalah `409 Conflict`.
       - "TELEGRAM_ARTICLE_BOT_TOKEN=${TELEGRAM_ARTICLE_BOT_TOKEN:-}"
+      # `API_TOKEN` milik `/api/v1` — **nama yang sama** dengan yang dibaca
+      # `freedium_web_rust` lewat `env_file`, karena keduanya satu rahasia yang
+      # sama. Di sini ia harus lewat interpolasi, dan itu satu-satunya alasan
+      # baris ini ada.
+      #
+      # Yang dibeli: tier tepercaya, 60 permintaan/menit dengan burst 20 dan
+      # `miss` 15/menit burst 5, alih-alih 3/menit burst **1** untuk anonim.
+      # Angka terakhir itu yang membuat dua tautan baru dalam dua puluh detik
+      # ditolak `429` — satu artikel menghabiskan dua permintaan `miss`.
+      #
+      # Yang **tidak** dibeli: satu pun tambahan anggaran fetch Medium. Kuota
+      # `fetch` proses-global tetap sama dan tetap dibebankan ke semua orang;
+      # ini memindahkan biaya satu klien dari "pemindai internet" ke pemilik
+      # server, bukan menambah pasokan.
+      - "API_TOKEN=${API_TOKEN:-}"
       # Literal, bukan `${VAR:-default}`, dengan alasan yang sama seperti di
       # `freedium_web_rust`: interpolasi membaca shell operator juga, jadi satu
       # variabel yang ter-export bisa diam-diam mengubah ke mana bot ini
