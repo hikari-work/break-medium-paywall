@@ -50,6 +50,46 @@
 # *dependency* against dummy sources, and the dependency layer is then keyed by
 # `Cargo.lock` instead of by the source.
 FROM rust:bookworm AS chef
+
+# Three build-time tools for exactly one crate in this tree: `btls-sys`, which
+# compiles BoringSSL for `wreq` — the impersonating client `medium-client` needs
+# to get past Medium's bot check (SPIKE-1, §3.1). Nothing else here uses any of
+# them.
+#
+#   * `cmake` — `btls-sys`'s build script drives BoringSSL's own CMake project
+#     (`build = "build/main.rs"`, `links = "boringssl"`).
+#   * `libclang-dev` — `btls-sys` build-depends on `bindgen` with its `runtime`
+#     feature and calls `generate_bindings` unconditionally, so clang-sys
+#     *dlopens* `libclang.so` while the build script runs. It is not a link-time
+#     dependency and it is not the C compiler; without it the build script fails
+#     with a "could not find libclang" error that names neither this file nor
+#     this package.
+#   * `perl` — BoringSSL's x86_64 assembly is generated through its own `.pl`
+#     preprocessor. It happens to be in the Debian base already, but relying on
+#     that is how a base image bump breaks the build.
+#
+# `clang` itself is **not** needed, which is an easy thing to get backwards:
+# `btls-sys` only forces `CMAKE_C_COMPILER=clang` when its `fips` feature is on
+# (`build/main.rs`), and the default build compiles with the `g++` the base image
+# already has. libclang and the C++ compiler are two different requirements.
+#
+# It goes in `chef` rather than in `cook`, so that `planner` and `build` get it
+# too — the `build` stage reuses `cook`'s `target/`, but a source edit that
+# invalidates part of that tree recompiles there, and it must not discover the
+# missing tool then. Same placement as `edge/Dockerfile`, which needs cmake for
+# zlib-ng.
+#
+# The runtime stage is unaffected: BoringSSL is linked statically, and
+# `gcr.io/distroless/cc-debian12` is the C/C++ variant that already carries
+# `libstdc++` — which is the new runtime requirement BoringSSL brings, and the
+# reason the *`cc`* distroless variant matters here rather than the plain one.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        libclang-dev \
+        perl
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /src

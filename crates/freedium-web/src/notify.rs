@@ -222,6 +222,7 @@ mod tests {
         let config = crate::config::Config {
             host_address: String::new(),
             medium_auth_cookies: None,
+            medium_impersonate: medium_client::wreq_transport::Profile::Chrome110,
             admin_secret_key: "s".into(),
             telegram_admin_id: if configured { 42 } else { 0 },
             telegram_bot_token: configured.then(|| "tok".to_string()),

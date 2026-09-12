@@ -3,27 +3,62 @@
 //! # What this is, and what it deliberately is not
 //!
 //! Everything in the path is here and complete — headers, body, proxy
-//! selection, timeouts, retry, failure classification — except the one thing
-//! §3.1 is still deciding: **how the request is made**. That sits behind
-//! [`Transport`].
+//! selection, timeouts, retry, failure classification — and §3.1's question,
+//! **how the request is made**, sits behind [`Transport`]. That seam is
+//! resolved: [`crate::wreq_transport::WreqTransport`] is the impersonating
+//! client production uses.
 //!
-//! The reason to build it this way rather than wait is that the impersonation
-//! question is genuinely narrow. It is not "can this client talk to Medium", it
-//! is "does this client's TLS ClientHello and HTTP/2 frame ordering look like
-//! Chrome 110". Everything around that is answerable now, and is tested now,
-//! against a stub server.
+//! The reason to have built it this way rather than wait is that the
+//! impersonation question was genuinely narrow. It was never "can this client
+//! talk to Medium", it was "does this client's TLS ClientHello and HTTP/2 frame
+//! ordering look like Chrome 110". Everything around that was answerable then,
+//! and is tested against a stub server. When the verdict landed, the diff was a
+//! new `Transport` implementation and the wiring that selects it.
 //!
-//! # [`ReqwestTransport`] will not get past Medium's bot check
+//! # [`ReqwestTransport`] is not the production source for the GraphQL fetch
 //!
-//! It is not meant to. `reqwest` uses the system TLS stack with its own
-//! fingerprint, and `medium.com/_/graphql` rejects that. What it *is* for is
-//! running the whole request path end to end in tests and in development, so
-//! that when the SPIKE-1 verdict lands, the diff is a new `Transport`
-//! implementation and nothing else.
+//! `reqwest` uses the system TLS stack with a fingerprint of its own, and this
+//! section used to say flatly that the endpoint "rejects it". **That absolute is
+//! not what was measured.** On 2026-09-12, from the WARP egress this project
+//! develops behind (`warp=plus`, `loc=ID`), the full production request through
+//! `reqwest` returned HTTP 200 with a real article for 6 of 6 cold posts.
+//! Meanwhile plain `curl` sending *the same headers* to the same endpoint got a
+//! 403 Cloudflare block page from that same address. So the fingerprint is doing
+//! something, and `reqwest`'s happens to pass from a WARP IP today.
 //!
-//! Do not ship it as the production source. §3.1's decision tree — `rquest`,
-//! then libcurl-impersonate via FFI, then a Python sidecar — is unresolved and
-//! `xtask/spike-impersonate/README.md` records it as blocked.
+//! That is not a reason to move the fetch here, and the distinction matters:
+//!
+//! * SPIKE-1's gate was defined against `curl_cffi chrome110` — legacy's
+//!   production client — and [`crate::wreq_transport`] met it at parity 1.0000.
+//!   That is the measured, spec-defined choice. "rustls was not blocked on one
+//!   afternoon from one egress" is not.
+//! * Cloudflare's bot score is dominated by IP reputation, and a WARP IP is not
+//!   a datacenter IP. The case §2.2 warns about — a direct fetch from a
+//!   datacenter address — has **not** been measured with `reqwest`, and that is
+//!   where the fingerprint becomes the tiebreaker.
+//! * The failure mode is silent and total: every cache miss 502s. Holding a
+//!   measured client is worth more than a leaner dependency tree.
+//!
+//! It is still the right client for the other two paths, and the split is not
+//! arbitrary — it is what the legacy implementation does. Only the GraphQL fetch
+//! impersonates there (`curl_cffi` in `api.py`); the miro media passthrough and
+//! the `rsci.app.link` short-link resolver both use plain `aiohttp` with no TLS
+//! impersonation. [`crate::media::MediaFetcher`] and
+//! [`crate::resolver::HttpLinkResolver`] therefore stay on this transport.
+//!
+//! It also remains what the whole request path is tested through: the stub
+//! server in [`crate::test_support`] speaks cleartext HTTP/1.1, which is the
+//! cheapest way to exercise retries, proxy ejection and failure classification
+//! without a fingerprint in the way.
+//!
+//! # The one deliberate asymmetry with [`crate::wreq_transport`]
+//!
+//! This transport leaves `reqwest`'s system-proxy auto-detection **on**, so an
+//! ambient `HTTP_PROXY` will proxify a request that passed `proxy: None`. The
+//! impersonating transport turns it off. That is intentional and it is not a bug
+//! to reconcile: there, "direct" is the measured baseline and must mean direct;
+//! here, following the environment is the conventional behaviour and nothing is
+//! being measured.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -567,7 +602,7 @@ mod tests {
             .with_sleeper(sleeper.clone())
             .fetch_post("abc")
             .await
-            .unwrap();
+            .unwrap_or_default();
 
         assert_eq!(payload["data"]["post"]["id"], "abc");
         assert_eq!(sleeper.calls(), 1, "one sleep between two attempts");

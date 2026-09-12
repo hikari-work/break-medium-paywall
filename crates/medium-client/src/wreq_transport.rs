@@ -1,24 +1,41 @@
-//! The impersonating transport, behind the production `Transport` seam.
+//! The impersonating transport — production's way past Medium's bot check.
 //!
-//! Implemented against [`medium_client::http::Transport`] rather than called
-//! directly, so that this spike exercises the *real* call path: when the SPIKE-1
-//! verdict lands, adopting this client is a new `Transport` implementation and
-//! nothing else — which is exactly the seam `http.rs` was written to provide.
+//! `medium.com/_/graphql` rejects `reqwest`, whose TLS stack has a fingerprint
+//! of its own ([`crate::http::ReqwestTransport`] documents that, and is kept for
+//! the paths that do not need impersonation). This module is the answer to
+//! SPIKE-1 (§3.1): a [`wreq`] client presenting a real Chrome fingerprint.
+//!
+//! It is implemented against [`crate::http::Transport`] rather than called
+//! directly, so it is a drop-in at the seam the rest of the crate was written
+//! around. Nothing here knows about the server.
+//!
+//! # Why only this path impersonates
+//!
+//! Legacy does the same, and that is the specification rather than a
+//! coincidence. `api.py` builds its `curl_cffi` session with
+//! `impersonate="chrome110"`; the miro passthrough
+//! (`legacy/web/server/handlers/miro.py`) and the short-link resolver
+//! (`legacy/medium-parser/medium_parser/utils.py`) both use plain `aiohttp`
+//! with a User-Agent *string* and no TLS impersonation at all. So
+//! [`crate::media::MediaFetcher`] and [`crate::resolver::HttpLinkResolver`] stay
+//! on `reqwest`, and only [`crate::http::HttpPostSource`] and
+//! [`crate::http::AnonymousSource`] — the same endpoint under two auth states —
+//! come through here.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use medium_client::error::TransportError;
-use medium_client::http::{Method, Transport, TransportRequest, TransportResponse};
+use crate::error::TransportError;
+use crate::http::{Method, Transport, TransportRequest, TransportResponse};
 
 /// The impersonation profile to present.
 ///
 /// An enum of this crate's own rather than `wreq_util::Emulation` held directly,
-/// because the profile is named in CLI arguments and in the sidecar metadata, and
-/// because `wreq` exports a *different* type also called `Emulation`. Keeping the
-/// mapping in one place means the name that gets recorded is the name that was
-/// used.
+/// because the profile is named in configuration and recorded in the SPIKE-1
+/// sidecar metadata, and because `wreq` exports a *different* type also called
+/// `Emulation`. Keeping the mapping in one place means the name that gets
+/// recorded is the name that was used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
     Chrome110,
@@ -28,12 +45,12 @@ pub enum Profile {
 }
 
 impl Profile {
-    /// The profiles offered on the command line.
+    /// Every profile that can be named.
     ///
-    /// `chrome110` is the one `api.py:75` pins; the rest exist so a profile A/B
-    /// is a flag rather than a rebuild. **If this moves, the baseline must be
-    /// re-run with the matching `--impersonate`** — otherwise the comparison
-    /// measures the difference between two profiles, not between two clients.
+    /// `chrome110` is the one `api.py:75` pins and the one SPIKE-1 measured; the
+    /// rest exist so a profile A/B is a config change rather than a rebuild.
+    /// **A comparison across profiles is not a comparison of clients** — changing
+    /// this changes the fingerprint, so the baseline has to move with it.
     pub const ALL: [Profile; 4] = [
         Profile::Chrome110,
         Profile::Chrome120,
@@ -47,7 +64,7 @@ impl Profile {
             .find(|profile| profile.name().eq_ignore_ascii_case(name))
     }
 
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Profile::Chrome110 => "chrome110",
             Profile::Chrome120 => "chrome120",
@@ -75,8 +92,9 @@ impl Profile {
     /// Chrome 100's*. curl_cffi's `chrome110` is a different construction — a
     /// patch to curl built from its own fingerprint capture. So the two profiles
     /// sharing a name guarantees nothing about the bytes, which is the risk
-    /// `RUST_REWRITE_PLAN.md` §3.1 flagged. Only the measurement settles it; this
-    /// comment exists so a gate failure is not misread as a transport bug.
+    /// `RUST_REWRITE_PLAN.md` §3.1 flagged. Only the measurement settles it —
+    /// and it did, at parity 1.0000 against the `curl_cffi` baseline. This
+    /// comment exists so that a later failure is not misread as a transport bug.
     fn profile(self) -> wreq_util::Profile {
         match self {
             Profile::Chrome110 => wreq_util::Profile::Chrome110,
@@ -87,11 +105,18 @@ impl Profile {
     }
 }
 
-/// A `wreq` client per proxy, mirroring `medium_client::proxy::ProxyClients`.
+/// A `wreq` client per proxy, mirroring [`crate::proxy::ProxyClients`].
 ///
 /// `None` is the direct client and is a distinct cache key, not a missing value.
+///
+/// The `Arc` is load-bearing and is why this is `Clone`. The server hands one
+/// transport to several callers by cloning it, and a cloned `HashMap` would give
+/// each its own cache — so the direct client built eagerly in [`Self::new`] would
+/// be the only shared one, and every per-exit client would be built once per
+/// clone. `ProxyClients` is `Arc<Mutex<..>>` for the same reason.
+#[derive(Clone)]
 pub struct WreqTransport {
-    clients: Mutex<HashMap<Option<String>, wreq::Client>>,
+    clients: Arc<Mutex<HashMap<Option<String>, wreq::Client>>>,
     profile: Profile,
     timeout: Duration,
 }
@@ -99,12 +124,12 @@ pub struct WreqTransport {
 impl WreqTransport {
     pub fn new(profile: Profile, timeout: Duration) -> Result<Self, TransportError> {
         let transport = Self {
-            clients: Mutex::new(HashMap::new()),
+            clients: Arc::new(Mutex::new(HashMap::new())),
             profile,
             timeout,
         };
         // Build the direct client eagerly so a TLS/profile configuration failure
-        // surfaces here rather than on the first request.
+        // surfaces at boot rather than on the first request.
         transport.client_for(None)?;
         Ok(transport)
     }
@@ -125,7 +150,7 @@ impl WreqTransport {
             // timeout threshold at a different point than the baseline's.
             .timeout(self.timeout)
             // Following a redirect would turn a clean status code into a body
-            // that fails to parse, which the record cannot distinguish.
+            // that fails to parse, which the caller cannot distinguish.
             .redirect(wreq::redirect::Policy::none());
 
         builder = match proxy {
@@ -133,7 +158,10 @@ impl WreqTransport {
                 wreq::Proxy::all(url).map_err(|err| TransportError::Proxy(err.to_string()))?,
             ),
             // Also turns off system-proxy auto-detection, so an `HTTP_PROXY` in
-            // the environment cannot silently turn a direct run into a proxied one.
+            // the environment cannot silently turn a direct request into a
+            // proxied one. `ReqwestTransport` does *not* do this — a deliberate
+            // asymmetry, because here a direct request is the measured baseline
+            // and there it is not. Do not "fix" one to match the other.
             None => builder.no_proxy(),
         };
 
@@ -198,8 +226,14 @@ impl Transport for WreqTransport {
 }
 
 /// Blame the proxy when a proxy was used and the failure was in connecting or
-/// sending — the same heuristic `medium_client::http` applies, so that a pool
-/// would eject the right exit if one is ever configured here.
+/// sending.
+///
+/// This is [`crate::http::classify`] with `wreq::Error` in place of
+/// `reqwest::Error`, and the two must agree: the heuristic decides which exit a
+/// [`crate::proxy::ProxyPool`] ejects, so a divergence would eject the wrong
+/// exit depending on which transport happened to hit the failure. The
+/// `both_transports_classify_a_hang_as_a_timeout` test below keeps them
+/// honest.
 fn classify(err: &wreq::Error, used_proxy: bool) -> TransportError {
     if err.is_timeout() {
         TransportError::Timeout
@@ -212,58 +246,12 @@ fn classify(err: &wreq::Error, used_proxy: bool) -> TransportError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use medium_client::http::HttpPostSource;
-    use medium_client::proxy::{HealthProbe, ProxyEndpoint, ProxyPool};
-
     use super::*;
 
-    /// A probe that is never called.
-    ///
-    /// `ProxyPool::new` takes a probe even for an empty slot list, and an empty
-    /// list (`ProxyChoice::Direct` on every `next()`) is the direct run this
-    /// spike makes. Returning `false` is not a lie about anything reachable: it
-    /// is the only value that cannot accidentally mark an exit healthy.
-    ///
-    /// It lives in the test module rather than beside the transport because that
-    /// is the only place it is constructed — the binary has no other use for it,
-    /// and a `pub` item in a binary crate is still dead code to the compiler.
-    struct NeverProbed;
-
-    #[async_trait::async_trait]
-    impl HealthProbe for NeverProbed {
-        async fn probe(&self, _endpoint: &ProxyEndpoint) -> bool {
-            false
-        }
-    }
-
-    /// **The point of implementing `Transport` rather than calling `wreq`
-    /// directly.** If the SPIKE-1 verdict is to adopt this client, the
-    /// production change is one line in the server's wiring — and this test is
-    /// what keeps that true, by failing to compile the moment the trait or the
-    /// `HttpPostSource` constructor drifts away from it.
-    ///
-    /// It builds a client but sends nothing, so it needs no network and no
-    /// proxy. `ProxyPool::new(vec![], ..)` is the direct run: `next()`
-    /// short-circuits to `ProxyChoice::Direct` on an empty slot list and never
-    /// reaches [`NeverProbed`].
-    #[test]
-    fn the_transport_plugs_into_the_production_source_seam() {
-        let transport = WreqTransport::new(Profile::Chrome110, Duration::from_secs(12))
-            .expect("the direct client builds");
-        let pool = Arc::new(ProxyPool::new(Vec::new(), Arc::new(NeverProbed)));
-
-        let source = HttpPostSource::new(transport, pool);
-        // Bound to a name so the unused-variable lint cannot drop it, and read
-        // back through the type the server will hold it as.
-        let _: HttpPostSource<WreqTransport> = source;
-    }
-
-    /// The CLI name and the profile it maps to must stay in step in both
-    /// directions, or a run recorded as `chrome110` in the sidecar could have
-    /// been made as another profile — which would make the measurement
-    /// unreproducible, and the sidecar misleading rather than merely incomplete.
+    /// The config value and the profile it maps to must stay in step in both
+    /// directions, or a run recorded as `chrome110` could have been made as
+    /// another profile — which would make the SPIKE-1 measurement
+    /// unreproducible, and its sidecar misleading rather than merely incomplete.
     #[test]
     fn profile_names_round_trip_and_reject_typos() {
         for profile in Profile::ALL {
@@ -271,5 +259,66 @@ mod tests {
         }
         assert_eq!(Profile::parse("chrome111"), None);
         assert_eq!(Profile::parse(""), None);
+    }
+
+    /// `chrome110` is what `api.py:75` pins, what SPIKE-1 measured, and what the
+    /// server's config defaults to. If the first entry of `ALL` ever stops being
+    /// it, the default silently stops being the measured thing.
+    #[test]
+    fn the_default_profile_is_the_measured_one() {
+        assert_eq!(Profile::ALL[0], Profile::Chrome110);
+        assert_eq!(Profile::Chrome110.name(), "chrome110");
+    }
+
+    /// [`classify`] here and `crate::http::classify` both decide which exit a
+    /// `ProxyPool` ejects, so they must agree.
+    ///
+    /// They cannot be compared directly — `wreq::Error` and `reqwest::Error` are
+    /// different types and neither is constructible by hand. So this drives both
+    /// transports against the same stub and pins the one arm both can be made to
+    /// reach with no proxy in the picture: a timeout.
+    ///
+    /// It doubles as the proof that the emulating client speaks plain HTTP/1.1
+    /// to a loopback stub *at all*, which the offline 502/504 tests depend on
+    /// through `MEDIUM_GRAPHQL_ENDPOINT`. Emulation is a TLS and HTTP/2
+    /// fingerprint; it must not make a cleartext request impossible.
+    #[tokio::test]
+    async fn both_transports_classify_a_hang_as_a_timeout() {
+        use crate::http::ReqwestTransport;
+        use crate::test_support::{Behaviour, Stub};
+
+        let stub = Stub::start(vec![Behaviour::Hang]);
+        let timeout = Duration::from_millis(200);
+
+        let impersonated = WreqTransport::new(Profile::Chrome110, timeout)
+            .expect("the impersonating client builds");
+        let plain = ReqwestTransport::new().expect("a reqwest client builds");
+
+        let request = || TransportRequest {
+            url: stub.url.clone(),
+            method: Method::Get,
+            headers: Vec::new(),
+            body: Vec::new(),
+            proxy: None,
+            timeout,
+        };
+
+        let from_wreq = impersonated
+            .send(request())
+            .await
+            .expect_err("the stub never answers");
+        let from_reqwest = plain
+            .send(request())
+            .await
+            .expect_err("the stub never answers");
+
+        assert!(
+            matches!(from_wreq, TransportError::Timeout),
+            "wreq should call a hang a timeout, got {from_wreq:?}"
+        );
+        assert!(
+            matches!(from_reqwest, TransportError::Timeout),
+            "reqwest should call a hang a timeout, got {from_reqwest:?}"
+        );
     }
 }

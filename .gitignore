@@ -183,6 +183,11 @@ postgres/
 /xtask/spike-impersonate/*.jsonl
 /xtask/spike-impersonate/*.meta.json
 /xtask/spike-impersonate/proxies.txt
+# The post-ID corpus, generated from `smokie_tests.py` by the one-liner in the
+# spike README. It is derived, and both runners must be handed the *same* file,
+# so a checked-in copy would be a second source of truth that could drift from
+# the tests it was extracted from.
+/xtask/spike-impersonate/post-ids.txt
 # The spike's Cargo.lock is deliberately NOT ignored, unlike the JSONL above: for
 # a measurement, the pinned `wreq`/`boring` revisions are part of the result.
 

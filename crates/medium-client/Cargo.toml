@@ -9,6 +9,22 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = ["wreq-transport"]
+# The impersonating transport, and therefore BoringSSL (`btls`/`btls-sys`) with
+# its cmake + libclang + perl build requirements.
+#
+# **On by default, because production needs it**: `medium.com/_/graphql` rejects
+# `reqwest`, so a server built without this cannot fetch a cache miss at all.
+# Turning it off gives a build with no C++ toolchain and a `reqwest`-only
+# transport — the SPIKE-1 harness uses that to develop its argument parsing and
+# JSONL emission on a machine that cannot compile the C++ tree.
+#
+# Note there is no `dep:async-trait` here, unlike the spike's feature list: in
+# this crate `async-trait` is a *mandatory* dependency, and cargo rejects `dep:`
+# for a dependency that is not optional.
+wreq-transport = ["dep:wreq", "dep:wreq-util"]
+
 [dependencies]
 # `resolver::HttpLinkResolver` implements `medium_doc::resolve::LinkResolver`,
 # so this crate depends on the IR crate and not the other way round — the seam
@@ -21,6 +37,10 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+# The impersonating client. Both pins are exact and deliberate — see the
+# commentary in the root manifest before touching either.
+wreq = { workspace = true, optional = true }
+wreq-util = { workspace = true, optional = true }
 # `generate_random_sha256_hash` (`medium_parser/utils.py:117`) is SHA-256 over 32
 # bytes from `secrets.token_bytes()`.
 sha2 = { workspace = true }

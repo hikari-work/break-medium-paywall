@@ -46,6 +46,44 @@ closed. §3.1's decision tree stops at option 1 — an impersonating client — 
 option 2 (libcurl-impersonate via FFI) is not needed. To close the deliverable,
 re-run both sides at `--n 500` with `--proxies` against a live pool.
 
+## The gate never measured `reqwest`, and one day it passed anyway
+
+Worth recording, because it was written down as an absolute and then contradicted.
+
+The claim was "`reqwest` will not get past Medium's bot check" — it appears in
+`crates/medium-client/src/http.rs` and in the Fase 3 module docs. **The gate above
+does not test it.** Both arms of the A/B are impersonating clients (`curl_cffi`
+and `wreq`); plain `reqwest` was never an arm, so its rejection was inherited
+assumption, not a measurement.
+
+On 2026-09-12, running the production server end to end (wiring check, see
+`crates/freedium-web/src/state.rs`) from the same WARP egress the runs above used:
+
+| client | headers | result |
+|---|---|---|
+| `reqwest` (production code) | full production set | **200**, real article, 6/6 cold posts |
+| `curl` | same full production set | 403 Cloudflare block page |
+| `curl` | minimal (UA + Content-Type) | 403 "Just a moment…" challenge |
+| `wreq` (production code) | full production set | 200 |
+
+So the fingerprint is load-bearing — `curl` is blocked with identical headers from
+the identical address — and `reqwest`'s rustls fingerprint happens to pass from a
+WARP IP today.
+
+**This does not move the fetch to `reqwest`,** and the reasons are the ones that
+made the gate the thing that decided it in the first place:
+
+- Cloudflare's bot score is dominated by IP reputation. A WARP IP is not a
+  datacenter IP, and §2.2's warned-about case — a direct fetch from a datacenter
+  address — has not been measured with `reqwest`.
+- The rules are not static. "rustls was not blocked on one afternoon from one
+  egress" is not a gate; parity 1.0000 against production's own client over a
+  defined corpus is.
+- The failure mode is silent and total: every cache miss 502s.
+
+The correct reading of the table is *the assumption was stated too strongly*, not
+*the impersonation is unnecessary*.
+
 ## What the earlier "BLOCKED" note got wrong
 
 The prerequisites table that stood here listed three blockers. Two were not real:
@@ -72,9 +110,10 @@ query, and the order now matches (`--echo-headers` on both sides differs only by
 
 - `baseline_curl_cffi.py` — the baseline runner. Lifts the query and the header
   order from `api.py`; runs in a venv with `curl_cffi` installed.
-- `src/main.rs`, `src/wreq_transport.rs` — the candidate runner, and the
-  impersonating client as a `medium_client::http::Transport` implementation, so
-  adopting it in production is a wiring change rather than a new call path.
+- `src/main.rs` — the candidate runner. The impersonating client itself now lives
+  in `crates/medium-client/src/wreq_transport.rs`: SPIKE-1's verdict was to adopt
+  it, so it moved to where production could reach it, and this harness became an
+  external consumer of it.
 - `difftest spike-impersonate-report` — the verdict tool. Pure offline scoring,
   compiled and unit-tested. Takes both logs and applies the gate.
 - 15 post IDs extracted from `tests/smokie_tests.py`, including the ones flagged
@@ -228,14 +267,16 @@ were anonymous.
 Written, in `src/`. Two things about it are worth knowing before reading the code:
 
 **It is a `Transport`, and the spike still does not drive it through
-`HttpPostSource`.** Implementing `medium_client::http::Transport` is what makes
-adoption a wiring change, and `wreq_transport.rs` has a test that fails to compile
-if that seam ever drifts. But the spike itself runs a plain loop, because
-`HttpPostSource` retries: `RetryPolicy::DEFAULT` is two attempts, so one record
-could mean two requests on the wire — inflating the candidate's rate against a
-baseline that sends one, doubling the load on Medium, folding backoff sleep into
-`elapsed_ms`, and dropping the status on `FetchError::NoPost`. Retry belongs in
-production; it does not belong in a measurement.
+`HttpPostSource`.** Implementing `medium_client::http::Transport` is what made
+adoption a wiring change, and it has since happened: the client is now
+`medium_client::wreq_transport::WreqTransport`, and the seam test lives in this
+harness's own `#[cfg(test)]` module — deliberately out here, where it is a
+cross-crate check rather than a tautology. But the spike itself still runs a plain
+loop, because `HttpPostSource` retries: `RetryPolicy::DEFAULT` is two attempts, so
+one record could mean two requests on the wire — inflating the candidate's rate
+against a baseline that sends one, doubling the load on Medium, folding backoff
+sleep into `elapsed_ms`, and dropping the status on `FetchError::NoPost`. Retry
+belongs in production; it does not belong in a measurement.
 
 **The profile name is not the fingerprint.** `wreq-util`'s `Chrome110` and
 curl_cffi's `chrome110` are different constructions, and `wreq-util`'s is not even
@@ -247,10 +288,18 @@ is why the gate, not a reading of the source, was the thing that decided it.
 
 `wreq` replaces the `rquest` that §3.1 named: `rquest` 5.2.0 is yanked and its
 crates.io metadata is broken. §3.4's warning still applies — `wreq` reaches
-BoringSSL through `boring2`/`tokio-boring2`, which are non-optional and have no
-rustls alternative, so the C++ toolchain requirement is now permanent for anything
-that depends on this client. That is why the directory has its own `[workspace]`
-and is `exclude`d from the root one.
+BoringSSL through `btls`/`btls-sys`, which are non-optional and have no rustls
+alternative, so the C++ toolchain requirement is permanent for anything that
+depends on this client.
+
+(The crate names are `btls`/`btls-sys`, not the `boring2`/`tokio-boring2` this
+paragraph and the root manifest used to name; the crates were renamed upstream,
+and neither lockfile contains a `boring*` package at all.)
+
+**Adopting this client moved that requirement into the root workspace.** The
+exclusion below is no longer what keeps BoringSSL out — `crates/medium-client`
+depends on it, so the root builds it either way. The harness stays excluded
+because it is a measurement harness and not production code.
 
 ## Decision tree (§3.1, verbatim, with the outcome)
 

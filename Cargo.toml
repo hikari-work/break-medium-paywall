@@ -1,15 +1,22 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask/*"]
-# `xtask/spike-impersonate` holds the SPIKE-1 harness. It is deliberately kept
-# out of the workspace: it depends on `wreq`, which pulls in `boring2`, whose
-# BoringSSL build needs a C++ toolchain and would slow every `cargo build` here.
-# Same reasoning as RUST_REWRITE_PLAN §3.4 for the edge workspace.
+# `xtask/spike-impersonate` holds the SPIKE-1 harness. It is kept out of the
+# workspace because it is a measurement harness, not production code: it writes
+# JSONL and a sidecar, its `main.rs` is 800 lines of argument parsing, and none
+# of that belongs in a workspace whose other members ship. Its own README carries
+# the measurement.
 #
 # It is a real package with its own manifest now — see its README for the
-# measurement — not the empty directory this exclusion was written for. It also
-# declares `rust-version = "1.98"`, higher than the workspace's, which is another
-# reason it cannot inherit from here.
+# measurement — not the empty directory this exclusion was written for.
+#
+# **The C++ toolchain is no longer a reason to exclude it.** That was the
+# original rationale, and it stopped being true once the impersonating transport
+# moved into `crates/medium-client`: the root workspace now builds BoringSSL
+# (`btls`/`btls-sys`, not the `boring2` this comment used to name — the crates
+# were renamed upstream, and `boring2` appears nowhere in either lockfile)
+# whether or not the spike is a member. Keeping the exclusion costs nothing and
+# keeps the harness's dependencies out of the production tree.
 #
 # `edge` is here for the same reason and is the case §3.4 predicted. It is its
 # own workspace root by its own `[workspace]` table — `members` above is
@@ -23,10 +30,8 @@ exclude = ["xtask/spike-impersonate", "edge"]
 version = "0.1.0"
 edition = "2024"
 # Raised to 1.98 for `wreq` 0.16.1 (§3.1 option 1 — adopted after the SPIKE-1
-# measurement). Nothing in the workspace *needs* 1.98 yet: the spike has its own
-# `rust-version` and the production crates still build on 1.85. This is the
-# groundwork for when the impersonating `Transport` moves into
-# `crates/medium-client`, so that landing it is not also a toolchain change.
+# measurement). `crates/medium-client` now depends on it, so this is load-bearing
+# rather than groundwork.
 rust-version = "1.98"
 
 [workspace.dependencies]
@@ -76,6 +81,32 @@ reqwest = { version = "0.13", default-features = false, features = [
     "charset",
     "gzip",
 ] }
+
+# --- SPIKE-1's answer: the impersonating client (§3.1 option 1) --------------
+#
+# `wreq` is the successor to the `rquest` §3.1 named — `rquest` 5.2.0 is yanked
+# and its crates.io metadata is broken. It builds BoringSSL (`btls`/`btls-sys`),
+# which is why this is the one entry here whose build needs more than a C
+# compiler: cmake, libclang for bindgen, and perl for BoringSSL's assembler.
+# `crates/freedium-web/Dockerfile` installs all three.
+#
+# **Exact pins, not caret ranges.** The profile and the BoringSSL revision behind
+# it are part of the SPIKE-1 result, not an implementation detail: a `0.16` range
+# could resolve a later `wreq`, and the measurement — parity 1.0000 against the
+# `curl_cffi` baseline, 150/150 requests at HTTP 200 — would then describe a
+# different artifact than production runs. Moving either pin means re-running the
+# measurement in `xtask/spike-impersonate`.
+#
+# `socks` matches `reqwest`'s feature above: the pool hands out
+# `socks5://host:port` strings and both transports parse them with the same
+# expectation. `wreq-util`'s `emulation` is what provides `Profile::Chrome110`.
+#
+# Default features are left ON, exactly as the spike declared them. Trimming them
+# would be a different configuration from the one measured — the whole point of
+# the pins above — and nothing here has established which of `wreq`'s defaults
+# the transport actually relies on.
+wreq = { version = "=0.16.1", features = ["socks"] }
+wreq-util = { version = "=0.2.0", features = ["emulation"] }
 
 # HTML parsing, used only by the differential-testing normalizer. Kept out of
 # the production crates: Fase 1 emits HTML from the IR and never parses it back.

@@ -22,28 +22,34 @@ description = "SPIKE-1 candidate: TLS-impersonating Medium fetch, measured again
 [features]
 default = ["wreq-transport"]
 # Off means no BoringSSL: `cargo run --no-default-features -- --dry-run` then
-# builds with no cmake/clang, so argument parsing, request construction and
+# builds with no cmake/libclang, so argument parsing, request construction and
 # JSONL emission stay developable on a machine that cannot build the C++ tree.
-wreq-transport = ["dep:wreq", "dep:wreq-util", "dep:async-trait"]
+#
+# This forwards to `medium-client` rather than naming `dep:` entries of its own,
+# now that the transport lives there. `--no-default-features` disables *this*
+# package's defaults and not its path dependency's, so without both the
+# `default-features = false` below and this forward, the escape hatch would
+# silently stop working — the transport would keep pulling BoringSSL in.
+wreq-transport = ["medium-client/wreq-transport", "dep:async-trait"]
 
 [dependencies]
 # The request surface is consumed, never re-declared: `request::{ENDPOINT,
 # FULL_POST_QUERY, headers, body, operation_id, client_date_ms}`. Both sides of
 # the measurement must send the same bytes, and a copied header block is exactly
 # the kind of drift that is invisible until the gate fails for the wrong reason.
-medium-client = { path = "../../crates/medium-client" }
+#
+# `default-features = false` so this harness controls the transport feature
+# itself — see the `wreq-transport` forwarding feature above.
+medium-client = { path = "../../crates/medium-client", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `wreq` and `wreq-util` were direct dependencies while the transport lived here.
+# They are not any more: the harness reaches the client through
+# `medium_client::wreq_transport`, and the exact pins that matter for
+# reproducibility now live in the root workspace manifest. Adding them back here
+# would re-introduce a second place for those pins to drift.
 async-trait = { version = "0.1", optional = true }
-# Pinned exactly: this is a measurement, so the impersonation profile and the
-# BoringSSL revision behind it are part of the result, not an implementation
-# detail. `wreq` is the successor to `rquest`, which §3.1 named — `rquest` 5.2.0
-# is yanked and its crates.io metadata is broken.
-wreq = { version = "=0.16.1", optional = true, features = ["socks"] }
-# Where the profiles live: `wreq_util::Emulation::Chrome110` is the counterpart
-# of the `impersonate="chrome110"` that `api.py:75` pins.
-wreq-util = { version = "=0.2.0", optional = true, features = ["emulation"] }
 
 [lints.rust]
 unsafe_code = "forbid"

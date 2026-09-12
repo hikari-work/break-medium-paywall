@@ -6,16 +6,33 @@
 //! server import ...`; here they are one `Clone`-able struct passed as axum
 //! state, which is the same thing with the wiring made explicit.
 //!
-//! # The source is constructed but is not production-ready
+//! # Two transports, and why
 //!
-//! [`AppState::source`] is an [`HttpPostSource`] over [`ReqwestTransport`], which
-//! has **no TLS impersonation and will not get past Medium's bot check** — see
-//! `medium-client`'s docs and §3.1. It is built here because Fase 3's job is to
-//! stand the server up and reach parity on everything that is not the fetch; the
-//! fetch itself is still SPIKE-1's open question.
+//! [`AppState::source`] and [`AppState::api_source`] go through
+//! [`medium_client::wreq_transport::WreqTransport`], which presents a Chrome
+//! fingerprint. It is the client SPIKE-1 measured against legacy's `curl_cffi`
+//! baseline at parity 1.0000 (§3.1), so it is the one with evidence behind it —
+//! `medium_client::http`'s module docs record the 2026-09-12 measurement showing
+//! the *plain* client also happened to pass from a WARP egress, and why that is
+//! not a reason to switch.
 //!
-//! It is behind `Arc<dyn PostSource>` precisely so that swapping it is a change
-//! to [`AppState::new`] and nothing else.
+//! The resolver, the media passthrough and the notifier stay on
+//! [`ReqwestTransport`]. That is not an oversight: the legacy implementation
+//! impersonates on exactly one of those paths (`curl_cffi` in `api.py`) and uses
+//! plain `aiohttp` for the other two, because Branch.io and the miro CDN do not
+//! fingerprint TLS. See `medium_client::wreq_transport`'s module docs.
+//!
+//! It is all behind `Arc<dyn PostSource>` / `Arc<dyn LinkResolver>`, which is
+//! what made the swap a change to [`AppState::new`] and nothing else.
+//!
+//! # What no test here can catch
+//!
+//! The seam erases the transport type, so **mis-wiring `source` back onto
+//! [`ReqwestTransport`] would still compile and still pass every test in this
+//! workspace** — `stub_state_with` below never calls [`AppState::new`] at all.
+//! The only proof that production fetches through the impersonating client is a
+//! real request for an uncached post through a running server. Do not treat a
+//! green `cargo test` as evidence for this particular line.
 
 use std::sync::Arc;
 
@@ -27,6 +44,7 @@ use medium_client::proxy::{HealthProbe, ProxyEndpoint, ProxyPool, WarpTraceProbe
 use medium_client::request;
 use medium_client::resolver::HttpLinkResolver;
 use medium_client::source::PostSource;
+use medium_client::wreq_transport::WreqTransport;
 use medium_doc::resolve::LinkResolver;
 use medium_render::templates;
 use minijinja::Environment;
@@ -93,7 +111,19 @@ impl AppState {
             .await
             .map_err(StateError::Redis)?;
 
-        let transport = ReqwestTransport::new().map_err(StateError::Transport)?;
+        // Two transports, split along the line the legacy draws.
+        //
+        // `impersonating` presents a Chrome fingerprint and is what makes
+        // `medium.com/_/graphql` answer at all; only the two post sources use it.
+        // `plain` is for the paths the legacy also leaves unimpersonated — see
+        // the module docs.
+        //
+        // `WreqTransport` clones share one client per exit, so handing it to both
+        // sources below is one connection pool and one TLS handshake per exit,
+        // not two.
+        let impersonating = WreqTransport::new(config.medium_impersonate, config.request_timeout)
+            .map_err(StateError::Transport)?;
+        let plain = ReqwestTransport::new().map_err(StateError::Transport)?;
 
         // `config.PROXY_LIST`, via the same in-process pool that replaced
         // HAProxy in Fase 2. An empty list is allowed and means "go direct",
@@ -118,7 +148,7 @@ impl AppState {
             .medium_graphql_endpoint
             .clone()
             .unwrap_or_else(|| request::ENDPOINT.to_string());
-        let source = HttpPostSource::new(transport.clone(), Arc::clone(&pool))
+        let source = HttpPostSource::new(impersonating.clone(), Arc::clone(&pool))
             .with_timeout(config.request_timeout)
             .with_endpoint(endpoint.clone())
             .with_auth_cookies(config.medium_auth_cookies.clone());
@@ -129,18 +159,18 @@ impl AppState {
         // unlock quota" impossible rather than merely absent. See
         // `medium_client::http`'s docs on the type, and §2.7's warning 2.
         let api_source = AnonymousSource::new(
-            transport.clone(),
+            impersonating,
             Arc::clone(&pool),
             config.request_timeout,
             endpoint,
         );
 
-        let resolver = HttpLinkResolver::new(transport.clone());
+        let resolver = HttpLinkResolver::new(plain.clone());
 
-        let media = MediaFetcher::new(transport.clone(), Arc::clone(&pool))
+        let media = MediaFetcher::new(plain.clone(), Arc::clone(&pool))
             .with_timeout(config.request_timeout);
 
-        let notifier = Telegram::new(transport, &config);
+        let notifier = Telegram::new(plain, &config);
 
         let limits = Arc::new(Limits::new(&config));
         // The keyed maps have no eviction of their own and their keys are chosen
@@ -214,7 +244,10 @@ fn health_probe() -> Arc<dyn HealthProbe> {
 /// Everything else — the templates, the media fetcher, the notifier, the proxy
 /// pool — is the real thing, because none of them reaches out at construction.
 /// `ReqwestTransport::new` builds a client and opens no sockets, and the pool is
-/// built over an empty list.
+/// built over an empty list. It is deliberately the *plain* transport rather than
+/// [`WreqTransport`]: the stub's `source` is always a fixture, so the transport
+/// here never sends anything, and building an impersonating client would only add
+/// a second, slower thing to construct per test.
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -267,6 +300,7 @@ pub(crate) mod tests {
         Config {
             host_address: "https://freedium.cfd".to_string(),
             medium_auth_cookies: None,
+            medium_impersonate: medium_client::wreq_transport::Profile::Chrome110,
             admin_secret_key: "test-secret".to_string(),
             telegram_admin_id: 0,
             telegram_bot_token: None,

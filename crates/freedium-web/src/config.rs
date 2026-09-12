@@ -30,6 +30,7 @@
 
 use std::time::Duration;
 
+use medium_client::wreq_transport::Profile;
 use thiserror::Error;
 
 /// `config.py:5`.
@@ -124,6 +125,27 @@ pub struct Config {
     /// `MEDIUM_AUTH_COOKIES`. Held because the legacy passes it to `MediumApi`;
     /// read by [`crate::state::AppState`] when it builds the source.
     pub medium_auth_cookies: Option<String>,
+
+    /// `MEDIUM_IMPERSONATE` — which fingerprint the outbound GraphQL fetch
+    /// presents.
+    ///
+    /// `chrome110` by default, because that is what `api.py:75` pins and what
+    /// SPIKE-1 measured at parity 1.0000 against the `curl_cffi` baseline. The
+    /// other profiles exist so a profile A/B is a config change rather than a
+    /// rebuild — **and a comparison across profiles is not a comparison of
+    /// clients**, so a baseline measured at one profile says nothing about
+    /// another.
+    ///
+    /// # The name is not the guarantee
+    ///
+    /// Worth knowing before "upgrading" this: `wreq_util`'s Chrome 110 profile
+    /// takes its *headers* from 110 but its **ClientHello and HTTP/2 settings
+    /// from Chrome 100** (`emulate/profile/chrome.rs`), while `curl_cffi`'s
+    /// `chrome110` is an unrelated construction built from its own fingerprint
+    /// capture. Two profiles sharing a name guarantees nothing about the bytes
+    /// on the wire. Only a measurement settles it — see
+    /// `xtask/spike-impersonate/README.md`.
+    pub medium_impersonate: Profile,
 
     /// `ADMIN_SECRET_KEY`. Required — see [`ConfigError`].
     pub admin_secret_key: String,
@@ -350,6 +372,7 @@ impl Config {
         Ok(Self {
             host_address: text("HOST_ADDRESS", DEFAULT_HOST_ADDRESS),
             medium_auth_cookies: optional("MEDIUM_AUTH_COOKIES"),
+            medium_impersonate: impersonate(optional("MEDIUM_IMPERSONATE"))?,
             admin_secret_key,
             telegram_admin_id: number("TELEGRAM_ADMIN_ID", 0_i64)?,
             telegram_bot_token: optional("TELEGRAM_BOT_TOKEN"),
@@ -497,6 +520,37 @@ fn positive(name: &'static str, value: u32) -> Result<u32, ConfigError> {
     }
     Ok(value)
 }
+
+/// The `MEDIUM_IMPERSONATE` value, or [`Config::medium_impersonate`]'s default.
+///
+/// Isolated for the same reason as [`non_empty`]: `set_var` is `unsafe` under
+/// `unsafe_code = "forbid"`, so `from_env` cannot be tested and the parsing has
+/// to be reachable without the environment.
+///
+/// An unrecognised name is a **boot failure, not a silent fallback**. Falling
+/// back to `chrome110` would mean a deployment that asked for one fingerprint
+/// and got another, with nothing in the logs to say so — and the whole point of
+/// the setting is that the fingerprint is the thing being controlled. The error
+/// names the alternatives.
+fn impersonate(raw: Option<String>) -> Result<Profile, ConfigError> {
+    let raw = match raw {
+        Some(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+        _ => DEFAULT_IMPERSONATE.to_string(),
+    };
+
+    Profile::parse(&raw).ok_or(ConfigError::Invalid {
+        name: "MEDIUM_IMPERSONATE",
+        value: raw,
+        expected: "one of chrome110, chrome120, chrome124, chrome136",
+    })
+}
+
+/// [`Config::medium_impersonate`]'s default.
+///
+/// `api.py:75`'s `impersonate="chrome110"`, and the profile SPIKE-1 measured.
+/// A test below pins it against `Profile::ALL[0]`, so this cannot drift away
+/// from the profile the transport itself considers the default.
+const DEFAULT_IMPERSONATE: &str = "chrome110";
 
 /// `CORS_ALLOW_ORIGINS` → the allowlist, matching [`parse_proxy_list`]'s
 /// unset-or-empty rule but not its literalness.
@@ -677,6 +731,76 @@ mod tests {
         assert_eq!(non_empty(Some(" tok ".into())).as_deref(), Some("tok"));
     }
 
+    /// The profile name is the whole setting, so an unrecognised one has to stop
+    /// the boot. See [`impersonate`] for why a silent fallback would be worse
+    /// than the failure: the deployment would run a fingerprint nobody asked
+    /// for and nothing would say so.
+    #[test]
+    fn an_unknown_impersonation_profile_is_a_boot_failure() {
+        let err = impersonate(Some("chrome999".into())).expect_err("must not fall back");
+
+        match err {
+            ConfigError::Invalid {
+                name,
+                value,
+                expected,
+            } => {
+                assert_eq!(name, "MEDIUM_IMPERSONATE");
+                // The offending value is echoed, which is what makes a typo in a
+                // `.env` findable from the log line alone.
+                assert_eq!(value, "chrome999");
+                // And the alternatives are listed, so the failure is also the
+                // documentation. Asserted on the name rather than the whole
+                // string so that adding a profile does not break this test.
+                assert!(expected.contains("chrome110"), "{expected}");
+            }
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
+    }
+
+    /// Absence and emptiness both mean *default*, the same rule [`non_empty`]
+    /// applies to `API_TOKEN` — and here the default is not "off" but the
+    /// measured profile.
+    #[test]
+    fn an_unset_impersonation_profile_is_the_default_one() {
+        for raw in [None, Some(String::new()), Some("   ".into())] {
+            assert_eq!(
+                impersonate(raw.clone()).expect("default must parse"),
+                Profile::Chrome110,
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// Trimmed and case-insensitive, because `Profile::parse` does both and the
+    /// value comes from a `.env` line a human typed. Pinned here rather than only
+    /// against `Profile::parse` because the trimming is this helper's job, not
+    /// the parser's.
+    #[test]
+    fn an_impersonation_profile_is_trimmed_and_case_insensitive() {
+        for raw in ["chrome120", " CHROME120 ", "Chrome120"] {
+            assert_eq!(
+                impersonate(Some(raw.into())).expect("must parse"),
+                Profile::Chrome120,
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// The default is a string literal and `Profile::ALL[0]` is the transport's
+    /// own idea of the default, so this is the one thing keeping the two from
+    /// drifting: if the transport's ordering ever changes, the config must move
+    /// with it rather than keep naming a profile the rest of the crate no longer
+    /// calls default.
+    #[test]
+    fn the_default_impersonation_profile_is_the_transports_default() {
+        const { assert!(DEFAULT_IMPERSONATE.eq_ignore_ascii_case(Profile::ALL[0].name())) };
+        assert_eq!(
+            impersonate(None).expect("default must parse"),
+            Profile::ALL[0]
+        );
+    }
+
     /// Zero is a boot failure, not a clamped value — `governor`'s `Quota` panics
     /// on a zero burst, so accepting one would move the failure out of the
     /// config and into a dependency's assertion.
@@ -766,6 +890,7 @@ mod tests {
         Config {
             host_address: DEFAULT_HOST_ADDRESS.into(),
             medium_auth_cookies: None,
+            medium_impersonate: Profile::Chrome110,
             admin_secret_key: "s".into(),
             telegram_admin_id: 0,
             telegram_bot_token: None,

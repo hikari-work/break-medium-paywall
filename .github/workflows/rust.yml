@@ -39,6 +39,27 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # SPIKE-1's verdict landed the impersonating client in
+      # `crates/medium-client`, so this job now compiles BoringSSL for `btls-sys`
+      # and needs three tools it never used to.
+      #
+      # `edge-check` below deliberately has no install step, on the grounds that
+      # the runners already carry cmake. This job does not take that on trust:
+      # it needs three packages, not one, and `libclang-dev` is the one least
+      # likely to be present. `btls-sys` build-depends on `bindgen` with its
+      # `runtime` feature and calls `generate_bindings` unconditionally, so
+      # clang-sys dlopens `libclang.so` at build-script time — the failure is a
+      # "could not find libclang" that names neither the crate nor this file.
+      # `perl` is BoringSSL's assembler preprocessor. `clang` the *compiler* is
+      # not needed unless `fips` is on, which is a different thing again.
+      #
+      # Installing explicitly costs seconds; the alternative is a gate that works
+      # only as long as the runner image happens to keep shipping these.
+      - name: Build tools for BoringSSL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libclang-dev perl
+
       - name: Format
         run: cargo fmt --all --check
 

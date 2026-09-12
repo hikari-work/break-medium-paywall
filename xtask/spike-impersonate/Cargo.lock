@@ -972,6 +972,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "wreq",
+ "wreq-util",
 ]
 
 [[package]]
@@ -1587,8 +1589,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "wreq",
- "wreq-util",
 ]
 
 [[package]]

@@ -22,6 +22,13 @@ freedium-dto = { version = "0.1.0", path = "../freedium-dto", features = ["opena
 futures-util = "0.3.34"
 getrandom.workspace = true
 governor.workspace = true
+# This crate is the reason `medium-client`'s `wreq-transport` feature is on by
+# default, and it **cannot be built without it**: `config::Config` names
+# `medium_client::wreq_transport::Profile` and `state::AppState` names
+# `WreqTransport`, both unconditionally, because a server that cannot impersonate
+# cannot fetch a cache miss from Medium at all. The feature's off position is for
+# `medium-client` on its own (`cargo check -p medium-client --no-default-features`)
+# and for `xtask/spike-impersonate`, not for production.
 medium-client = { version = "0.1.0", path = "../medium-client" }
 medium-doc = { version = "0.1.0", path = "../medium-doc" }
 medium-render = { version = "0.1.0", path = "../medium-render" }
