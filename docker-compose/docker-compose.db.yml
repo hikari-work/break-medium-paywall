@@ -48,18 +48,17 @@ services:
       retries: 5
     stop_grace_period: 2m
 
-  pgadmin4_freedium:
-    image: dpage/pgadmin4:8.12
-    container_name: pgadmin4_freedium
-    networks:
-      - freedium_net
-    ports:
-      - 5433:80
-    env_file:
-      - ../.env
-    hostname: pgadmin4_freedium
-    restart: always
-    tty: true
+  # `pgadmin4_freedium` (dpage/pgadmin4) used to sit here; removed 2026-09-12.
+  #
+  # Nothing depended on it — it was a human-facing Postgres UI. Three things
+  # made it worse than it looked: it published `5433:80`, the host port the
+  # borrowed `klon-pg` holds and the one `.env`'s host-run `DATABASE_URL`
+  # points at, so it could not start while that Postgres was up; it carried no
+  # `profiles:` key, so it sat in the *default* profile and was meant to come
+  # up in production as well; and `.env` gave it `root@root.com` / `root`.
+  #
+  # `psql` against `postgres_freedium` covers the same need without a
+  # published port. A pgAdmin is one `docker run` away when it is wanted.
 
 volumes:
   freedium_dragonflydata:

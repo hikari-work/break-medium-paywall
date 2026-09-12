@@ -221,11 +221,12 @@ with `-f /tmp/shadow-override.yml` added to every `docker compose` line above an
 `DATABASE_URL` pointed at `127.0.0.1:15432`. `gen-shadow-seed` is the only part of
 the run that needs it; the two servers talk to Postgres over the compose network.
 
-The stack also brings up `pgadmin4_freedium` — a base service in
-`docker-compose.db.yml`, not gated on a profile — which binds 5433 on the host. On
-the machine this was proven on, that port was already taken by another project, so
-it stayed in `Created` while every step above worked: nothing in the proof goes
-through pgAdmin.
+A third service used to sit here, `pgadmin4_freedium`, and it bound 5433 on the
+host — the port another project already held — so it stayed in `Created` while
+every step above worked; nothing in the proof went through it. It has since been
+removed from `docker-compose.db.yml` (2026-09-12). Kept as a second sighting of
+the collision the override above exists to dodge — and as the reason a check of
+"which services does this stack actually bring up" is worth running once.
 
 ### The render cache will lie to you
 

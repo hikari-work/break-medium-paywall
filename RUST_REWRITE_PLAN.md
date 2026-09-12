@@ -592,7 +592,12 @@ bentuk Fase 2, jadi jangan kerjakan paralel.
 Jangan sentuh, di luar scope:
 
 - `docker-compose/`, `wgcf/` — infra tetap (kecuali menghapus service
-  `haproxy-proxy-balancer` di Fase 2 dan `caddy_freedium*` di Fase 7)
+  `haproxy-proxy-balancer` di Fase 2, `caddy_freedium*` di Fase 7, dan
+  `pgadmin4_freedium` — yang terakhir **tidak terikat fase apa pun**: rewrite
+  tidak pernah menyentuhnya, tapi ia dihapus 2026-09-12 karena portnya
+  (`5433:80`) bentrok dengan `klon-pg` yang justru ditunjuk `DATABASE_URL`
+  host-run, dan karena ia UI admin Postgres berkredensial `root`/`root` tanpa
+  key `profiles:` sehingga ikut terangkat di profil default — yaitu produksi)
 - `plausible/` — analytics. Catatan: Caddy sekarang juga mem-proxy
   `freedium_plausible:8000` di `:6753`; Pingora harus meneruskan itu, atau
   Plausible di-expose langsung
