@@ -23,7 +23,7 @@
 
 There is three (3) docker-compose profiles:
 
-- `min` - without 2 Cluster of Cloudflare WARP proxy, HAProxy proxy balancer, Plausible, Grafana.
+- `min` - without the Cloudflare WARP proxy cluster, Plausible, Grafana.
 - `local` - based on `min`, but with `freedium.local` exposed hostname, both 80 and 443 ports are exposed, with self-signed TLS certificate.
 - `prod` - with all services for production.
 

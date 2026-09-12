@@ -17,15 +17,20 @@
 //! - [`inline_html`] — an `Inline` tree → HTML, shared by the renderer and by
 //!   the parser's highlight check.
 //! - [`parse`] — a GraphQL post payload → a `Document`.
+//! - [`metadata`] — the page metadata `post.html` interpolates, escaped and
+//!   formatted exactly as `generate_metadata` does.
 //! - [`resolve`] — Medium URLs → post ids, and the domain lists that decide
 //!   which URLs are Medium's at all.
+//! - [`textwrap`] — CPython's `textwrap.shorten`, for the post description.
 
 pub mod difflib;
 pub mod escape;
 pub mod inline;
 pub mod inline_html;
 pub mod ir;
+pub mod metadata;
 pub mod parse;
 pub mod resolve;
 pub mod text;
+pub mod textwrap;
 pub mod utf16;

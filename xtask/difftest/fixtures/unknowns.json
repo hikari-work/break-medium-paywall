@@ -6,6 +6,13 @@
     "data": {
       "post": {
         "title": "An Article",
+        "creator": {"id": "creator-1", "name": "Ada Lovelace", "username": "ada", "bio": "Writes about engines.", "imageId": "1*creator"},
+        "collection": {"id": "collection-1", "name": "Analytical Engines", "slug": "analytical-engines", "shortDescription": "A publication about computation.", "avatar": {"id": "1*avatar"}},
+        "mediumUrl": "https://medium.com/@ada/unknowns",
+        "readingTime": 3,
+        "isLocked": false,
+        "firstPublishedAt": 1692000000000,
+        "updatedAt": 1692000000000,
         "previewContent": { "subtitle": "A subtitle" },
         "previewImage": { "id": "preview" },
         "highlights": [],

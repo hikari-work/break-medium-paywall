@@ -12,30 +12,69 @@ plan requires it be settled before any production Rust is written.
 **Gate: the candidate client's success rate must be ≥99% of the `curl_cffi`
 baseline, over the same requests, through the same WARP pool.**
 
-## Status: BLOCKED — not yet measured
+## Status: measured on a direct egress — PASS; the pooled gate is still open
 
-The measurement cannot be taken in the current working tree. All three
-prerequisites are missing:
+A Rust client clears the fingerprint. `xtask/spike-impersonate` (`wreq` 0.16.1 +
+`wreq-util` 0.2.0, `Emulation::Chrome110`) and `curl_cffi` 0.16.3 were run
+head-to-head, direct, on 2026-09-12, 50 requests each, over the same 15-post list:
 
-| Prerequisite | State here |
+| run | ok/total | rate | p50 | p95 |
+|---|---|---|---|---|
+| baseline (`curl_cffi`, before) | 46/50 | 92.00% | 695 ms | 900 ms |
+| candidate (`wreq`) | 46/50 | 92.00% | 595 ms | 918 ms |
+| baseline (`curl_cffi`, after) | 46/50 | 92.00% | — | — |
+
+`parity = 1.0000`, gate `>= 0.99` → **PASS**.
+
+Read the two caveats before quoting that number, because both are the kind that
+make a parity figure mean less than it looks:
+
+- **Every one of the 150 requests returned HTTP 200.** There was no 403 and no
+  Cloudflare challenge on either side, so the 92% is not a blocked-vs-blocked
+  floor. The 4 failures are the *same* post, `b4ee755ee6c5`, in all three runs —
+  `{"data":{"post":null,...}}`, a deleted or unpublished post. It is a property
+  of that post, not of either client.
+- **This was a direct run, not the formal §3.1 gate.** The gate is specified
+  "through the same WARP pool", and the `wgcf1..N` compose pool is not running
+  here. What was measured is the host's own egress, which happens to be WARP
+  already (`cdn-cgi/trace` → `warp=plus`, `loc=ID`) — so it is a WARP egress, but
+  not *the pool's* exits. A pooled run tests the same TLS question through
+  different addresses; it can still fail on proxy handling.
+
+**Consequence for Phase 0:** the `PostSource` decision is *supported* but not
+closed. §3.1's decision tree stops at option 1 — an impersonating client — and
+option 2 (libcurl-impersonate via FFI) is not needed. To close the deliverable,
+re-run both sides at `--n 500` with `--proxies` against a live pool.
+
+## What the earlier "BLOCKED" note got wrong
+
+The prerequisites table that stood here listed three blockers. Two were not real:
+
+| Claimed prerequisite | Reality |
 |---|---|
-| `curl_cffi` installed | absent (`ModuleNotFoundError`) |
-| WARP pool `wgcf1..N` | `wgcf1` and `haproxy-pb` do not resolve |
-| `curl_cffi` reached `medium.com` without a 403 | `curl https://medium.com` → **403** |
+| `curl_cffi` not installed | True, and easy to fix — a wheel for this interpreter exists. Both sides now run from a venv. |
+| The pool does not resolve | Refers to the **Docker** pool. The host already egresses through WARP natively, so a direct run *is* a WARP run. |
+| `curl_cffi` gets a 403 from medium.com | The probe behind this tested **plain `curl`**. A plain `curl` 403 is the premise `curl_cffi` exists to defeat, not evidence about `curl_cffi`. |
 
-The pool is not incidental. §3.1 measures parity *through the WARP egress*, so a
-run without it measures a different thing, and running 500 requests at Medium
-from an unpoxied IP would both fail differently and abuse an address that is not
-a designated egress. `baseline_curl_cffi.py` refuses to run without
-`--proxies` for exactly this reason.
+The third one is the one worth remembering: it is a measurement of the wrong
+program, and it sat in this file as a blocker for a phase.
 
-**Consequence for Phase 0:** the `PostSource` decision stays open. It is the one
-Phase 0 deliverable that cannot be closed here.
+A real bug was also found and fixed while re-checking the baseline:
+`baseline_curl_cffi.py` re-declared the request headers in a literal dict, and had
+drifted from `api.py:36-48` — it put both Apollo headers last instead of first.
+Since the whole point is comparing two clients' request bytes, that would have
+been measured as a difference between the clients. It now lifts the header names
+*and their order* out of `api.py` with `ast`, exactly as it already did for the
+query, and the order now matches (`--echo-headers` on both sides differs only by
+`Connection`, which is hop-by-hop and dropped under HTTP/2).
 
-## What *is* done
+## What is here
 
-- `baseline_curl_cffi.py` — the baseline runner (runs in an environment with the
-  pool; `--dry-run` validates plumbing anywhere).
+- `baseline_curl_cffi.py` — the baseline runner. Lifts the query and the header
+  order from `api.py`; runs in a venv with `curl_cffi` installed.
+- `src/main.rs`, `src/wreq_transport.rs` — the candidate runner, and the
+  impersonating client as a `medium_client::http::Transport` implementation, so
+  adopting it in production is a wiring change rather than a new call path.
 - `difftest spike-impersonate-report` — the verdict tool. Pure offline scoring,
   compiled and unit-tested. Takes both logs and applies the gate.
 - 15 post IDs extracted from `tests/smokie_tests.py`, including the ones flagged
@@ -43,17 +82,39 @@ Phase 0 deliverable that cannot be closed here.
 
 ## Running the spike
 
-On a host with the WARP pool reachable:
+Both sides must be given **the same post-ID file**. Generate it from the
+baseline's own parser rather than by hand, so the two runs cannot disagree about
+which post sits at which sequence number:
+
+```bash
+python3 -c "
+import importlib.util, pathlib
+spec = importlib.util.spec_from_file_location('b', 'baseline_curl_cffi.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+pathlib.Path('post-ids.txt').write_text('\n'.join(m.smoke_test_post_ids()) + '\n')
+"
+```
+
+> **Do not put slug URLs in that file.** Both runners take the last path segment
+> verbatim, so `https://medium.com/@x/a-post-27832c8f6644` becomes the id
+> `a-post-27832c8f6644`, both sides fail on it, and the report reads as perfect
+> parity. The candidate refuses such a file before sending anything; the baseline
+> does not. `smoke_test_post_ids()` strips slugs, which is why the list is
+> generated above rather than assembled by hand.
 
 ```bash
 pip install curl_cffi
 
-# 1. Baseline (the current production path).
+# 1. Baseline (the current production path), direct.
 python3 baseline_curl_cffi.py \
-    --n 500 --proxies proxies.txt --out baseline.jsonl
+    --n 50 --concurrency 8 --allow-no-proxy --impersonate chrome110 \
+    --post-ids post-ids.txt --out baseline.jsonl
 
-# 2. Candidate (rquest). Must emit the same schema — see below.
-#    Run it with the identical --n, --proxies and post-ID list.
+# 2. Candidate. Same --n, same --concurrency, same post-ID file.
+#    Omit --proxies for a direct run; pass --proxies <file> for the pooled one,
+#    and then also drop --allow-no-proxy from step 1.
+cargo run --release -- --n 50 --concurrency 8 \
+    --post-ids post-ids.txt --out candidate.jsonl
 
 # 3. Verdict. Offline; runs anywhere.
 cargo run --release -p difftest -- spike-impersonate-report \
@@ -62,15 +123,29 @@ cargo run --release -p difftest -- spike-impersonate-report \
 
 Exit code 0 means the gate passed. `--threshold` defaults to `0.99`.
 
+Run the two sides **A/B/A** in one session — baseline, candidate, baseline again
+— so that temporal drift in Medium's own behaviour shows up as a difference
+between the two baseline runs rather than as a difference between the clients.
+`--impersonate` and `--emulation` must name the same profile on both sides, or the
+comparison measures the profiles instead of the implementations.
+
 Validate plumbing before committing to a 500-request run:
 
 ```bash
 python3 baseline_curl_cffi.py --dry-run --n 20 --out plumbing.jsonl
+cargo run -- --dry-run --n 20 --post-ids post-ids.txt --out plumbing-rs.jsonl
 ```
 
 Dry-run rows carry `"ok": null` and `"dry_run": true`; the report tool **refuses
 to score them** rather than dropping them, so a plumbing check can never be
 mistaken for a measurement.
+
+Each run also writes `<out>.meta.json` beside the records — profile, argv, the
+post-ID list, and start/end times. Metadata never goes *inside* the JSONL: the
+report tool rejects a whole file on its first unparseable line.
+
+`--echo-headers` prints the header order each side intends to send, with no
+network and no `--out`, for diffing the two.
 
 ## Record schema
 
@@ -93,7 +168,20 @@ One JSON object per attempt, one attempt per line. Both sides must emit this.
 
 An `ok: true` row must mean *the post actually came back*: the baseline counts a
 200 without `data.post` as a failure, because a 200 carrying an error body is not
-a successful fetch.
+a successful fetch. That rule is Python truthiness, not Rust's `is_some`:
+`{"data":{"post":null}}` **and** `{"data":{"post":{}}}` are both failures. The
+candidate reproduces it exactly and has unit tests pinning both edges, because a
+client that scored them differently would move its own success rate without
+anything on the wire differing.
+
+The candidate adds three keys, which the report ignores (its `Attempt` is not
+`deny_unknown_fields`):
+
+| Extra field | Meaning |
+|---|---|
+| `seq` | Request index. The report does not check that the two files agree row for row, so this is the only way to confirm both sides requested the same posts in the same order. |
+| `emulation` | The profile used, so a file cannot be mistaken for a run of another profile. |
+| `validate_ok` | `medium_client::response::validate`'s verdict, recorded *beside* `ok` rather than instead of it. The two disagree at two edges (`{"error": null, ...}` and `{"data":{"post":{}}}`), and the run prints a note if they ever diverge. |
 
 ## Request shape
 
@@ -123,37 +211,60 @@ Cookie:                  <only when MEDIUM_AUTH_COOKIES is set — see §2.7 war
 Body: `{"operationName":"FullPostQuery","variables":{"postId":<id>,"postMeteringOptions":{}},"query":<query>}`
 to `POST https://medium.com/_/graphql`.
 
-## The candidate client is not written yet — deliberately
+The candidate takes all of this from `medium_client::request` instead of
+transcribing it: the endpoint, the query, and the header names, order and values.
+Nothing about the request is re-declared on the Rust side, because a copied header
+block is exactly the drift that shows up as a gate failure for the wrong reason.
+`Connection` is the single exception and it is deliberate — see
+`medium_client::request::headers`.
 
-`rquest` is intentionally **not** a dependency here, and no Rust candidate client
-is committed. Two reasons:
+**The spike never sets `MEDIUM_AUTH_COOKIES`, and neither should a re-run.**
+§2.7 warning 2: that is a subscriber account's session, and the
+`MeteringInfoData` unlock quota it buys is bound to that account. All runs above
+were anonymous.
 
-1. §3.4 warns that `rquest` and `pingora` both reach BoringSSL through
-   `boring-sys`; a mismatched version pair will not resolve in one workspace, and
-   the BoringSSL build needs a C++ toolchain and is slow. The directory is
-   `exclude`d from the root workspace for the same reason the plan gives the edge
-   its own workspace.
-2. Pinning rquest's impersonation API blind would mean committing code that has
-   never compiled. `rquest` has moved that API across major versions
-   (`Impersonate::Chrome110` on a client builder in some releases, `rquest-util`
-   in others), so the exact incantation must be taken from the version actually
-   pinned.
+## The candidate client
 
-The shape of the client is a small adapter behind the `PostSource` trait (§2.6):
-build the request above, send it through a client configured with a
-Chrome-like impersonation profile and the SOCKS5 proxy, return the parsed JSON
-or an error. Budget ~60 lines plus the record emitter.
+Written, in `src/`. Two things about it are worth knowing before reading the code:
 
-## Decision tree (§3.1, verbatim)
+**It is a `Transport`, and the spike still does not drive it through
+`HttpPostSource`.** Implementing `medium_client::http::Transport` is what makes
+adoption a wiring change, and `wreq_transport.rs` has a test that fails to compile
+if that seam ever drifts. But the spike itself runs a plain loop, because
+`HttpPostSource` retries: `RetryPolicy::DEFAULT` is two attempts, so one record
+could mean two requests on the wire — inflating the candidate's rate against a
+baseline that sends one, doubling the load on Medium, folding backoff sleep into
+`elapsed_ms`, and dropping the status on `FetchError::NoPost`. Retry belongs in
+production; it does not belong in a measurement.
+
+**The profile name is not the fingerprint.** `wreq-util`'s `Chrome110` and
+curl_cffi's `chrome110` are different constructions, and `wreq-util`'s is not even
+Chrome 110's: its `v110` module takes `v100::build_emulation` for the TLS and
+HTTP/2 settings, so only the *headers* are 110's (`emulate/profile/chrome.rs`).
+curl_cffi's `chrome110` is a patch to curl built from its own capture. The two
+matching by name guarantees nothing, which is exactly the risk §3.1 flagged — and
+is why the gate, not a reading of the source, was the thing that decided it.
+
+`wreq` replaces the `rquest` that §3.1 named: `rquest` 5.2.0 is yanked and its
+crates.io metadata is broken. §3.4's warning still applies — `wreq` reaches
+BoringSSL through `boring2`/`tokio-boring2`, which are non-optional and have no
+rustls alternative, so the C++ toolchain requirement is now permanent for anything
+that depends on this client. That is why the directory has its own `[workspace]`
+and is `exclude`d from the root one.
+
+## Decision tree (§3.1, verbatim, with the outcome)
 
 Stop at the first option that clears the gate:
 
-1. **`rquest`** — BoringSSL, chrome/safari impersonation profiles. Gate: ≥99%
-   parity over 500 requests through the WARP pool.
+1. **An impersonating Rust client** — the plan says `rquest`; that crate is
+   yanked, and **`wreq` 0.16.1 is what was measured**. Gate: ≥99% parity over 500
+   requests through the WARP pool. → **This option is the one that works.** The
+   direct run above cleared the fingerprint; the pooled 500-request run is what
+   remains to formally close it.
 2. **libcurl-impersonate via FFI** — link the `.so` that `curl_cffi` already
-   binds. Heavier build, identical fingerprint.
+   binds. Heavier build, identical fingerprint. → Not needed.
 3. **Python sidecar fetcher** — keep ~80 LOC of Python exposing
-   `POST /fetch/{post_id}` behind the `PostSource` trait.
+   `POST /fetch/{post_id}` behind the `PostSource` trait. → Not needed.
 
 If 1 and 2 fail, **still proceed with 3**. The plan is explicit that a TLS
 fingerprint problem must not cancel the rewrite: the parser and renderer — the

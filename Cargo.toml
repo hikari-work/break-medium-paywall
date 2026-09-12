@@ -2,16 +2,32 @@
 resolver = "3"
 members = ["crates/*", "xtask/*"]
 # `xtask/spike-impersonate` holds the SPIKE-1 harness. It is deliberately kept
-# out of the workspace: pinning `rquest` pulls in `boring-sys`, whose BoringSSL
-# build needs a C++ toolchain and would slow every `cargo build` here for a
-# spike that cannot even run without the WARP pool. Same reasoning as
-# RUST_REWRITE_PLAN §3.4 for the edge workspace.
-exclude = ["xtask/spike-impersonate"]
+# out of the workspace: it depends on `wreq`, which pulls in `boring2`, whose
+# BoringSSL build needs a C++ toolchain and would slow every `cargo build` here.
+# Same reasoning as RUST_REWRITE_PLAN §3.4 for the edge workspace.
+#
+# It is a real package with its own manifest now — see its README for the
+# measurement — not the empty directory this exclusion was written for. It also
+# declares `rust-version = "1.98"`, higher than the workspace's, which is another
+# reason it cannot inherit from here.
+#
+# `edge` is here for the same reason and is the case §3.4 predicted. It is its
+# own workspace root by its own `[workspace]` table — `members` above is
+# `crates/*` and `xtask/*`, so nothing matches it — and this entry is what makes
+# that fact visible to someone reading the root manifest rather than only to
+# someone reading `edge/Cargo.toml`. What it keeps out: Pingora, and therefore
+# the TLS-provider question that SPIKE-3 is about.
+exclude = ["xtask/spike-impersonate", "edge"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Raised to 1.98 for `wreq` 0.16.1 (§3.1 option 1 — adopted after the SPIKE-1
+# measurement). Nothing in the workspace *needs* 1.98 yet: the spike has its own
+# `rust-version` and the production crates still build on 1.85. This is the
+# groundwork for when the impersonating `Transport` moves into
+# `crates/medium-client`, so that landing it is not also a toolchain change.
+rust-version = "1.98"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +37,46 @@ regex = "1"
 url = "2"
 form_urlencoded = "1"
 psl = "2"
+
+# --- Fase 2: the I/O layer (freedium-cache, medium-client) -------------------
+#
+# These are the first dependencies in the workspace that pull a large tree
+# (TLS, async runtimes, a Postgres driver). That is the price of the I/O
+# layer; the Fase 1 crates stay dependency-light and are unaffected.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+thiserror = "2"
+async-trait = "0.1"
+hex = "0.4"
+# 32 random bytes for the X-APOLLO-OPERATION-ID hash, replacing Python's
+# `secrets.token_bytes()`. `getrandom` rather than `rand`: we want entropy, not
+# a PRNG API, and `rand`'s has churned across 0.8/0.9/0.10.
+getrandom = "0.4"
+sha2 = "0.11"
+rmp-serde = "1"
+# Pinned to 0.8 rather than 0.9. The MSRV is no longer the reason — 0.9's 1.94
+# is below the 1.98 declared above. The reason is that 0.8 is the version Fase 2
+# was written and verified against, and moving a database driver is its own
+# change with its own verification, not a rider on a toolchain bump.
+# 0.9 also buys nothing here: this crate uses runtime `sqlx::query()` only, never
+# the `query!` macros, so the build needs no live DATABASE_URL and no `macros`
+# feature.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "tls-rustls-ring",
+] }
+fred = "10"
+# `socks` is the feature the plan calls out (§1's `aiohttp_socks` row). rustls
+# rather than the native-tls default so the build needs no OpenSSL headers.
+reqwest = { version = "0.13", default-features = false, features = [
+    "socks",
+    "json",
+    "http2",
+    "rustls",
+    "charset",
+    "gzip",
+] }
+
 # HTML parsing, used only by the differential-testing normalizer. Kept out of
 # the production crates: Fase 1 emits HTML from the IR and never parses it back.
 # The versions are pinned as a pair — `markup5ever_rcdom` 0.39 requires
@@ -28,6 +84,16 @@ psl = "2"
 # `markup5ever` trees, so the `NodeData` types would not line up.
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
+
+# --- Fase 3: the page templates ---------------------------------------------
+#
+# `minijinja` 2.x, not 3.x: 3.0 is still an alpha, and the whole point of using
+# this engine is that it is the closest thing in Rust to the Jinja2 the legacy
+# templates were written for. `minijinja-embed` compiles `templates/` into the
+# binary, so the runtime image needs no template directory — which is what lets
+# it be distroless.
+minijinja = "2"
+minijinja-embed = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

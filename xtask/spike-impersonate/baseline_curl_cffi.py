@@ -6,15 +6,24 @@ whole rewrite, and requires a measured ≤1% regression gate before any producti
 Rust is written. This script produces the *baseline* half of that measurement:
 it replays `FullPostQuery` the same way `medium_parser/api.py` does today.
 
-It deliberately does **not** re-declare the GraphQL query. The query is lifted
-out of `medium-parser/medium_parser/api.py` with `ast`, so there is exactly one
-source of truth and the baseline cannot drift away from production behaviour.
+It deliberately does **not** re-declare the GraphQL query, nor the request
+headers. Both are lifted out of `medium-parser/medium_parser/api.py` with `ast`,
+so there is exactly one source of truth and the baseline cannot drift away from
+production behaviour.
 
-Requires `curl_cffi`. The candidate side (rquest) is expected to emit the same
+The header *order* is extracted, not just the values. On the wire the two are not
+separable — an earlier revision of this file kept the names in a hand-written
+dict and appended the two Apollo headers at the end, which reordered them
+relative to `api.py:36-48`. Since the whole point of SPIKE-1 is to compare two
+clients' *request* bytes, a header order that differs from production would have
+been measured as a difference between the clients.
+
+Requires `curl_cffi`. The candidate side (`wreq`, see Cargo.toml) emits the same
 JSONL schema — see README.md in this directory for the record format.
 
     python3 baseline_curl_cffi.py --n 500 --out baseline.jsonl
     python3 baseline_curl_cffi.py --dry-run --n 20 --out plumbing_check.jsonl
+    python3 baseline_curl_cffi.py --echo-headers
 
 Standard library plus `curl_cffi`; makes real network requests unless --dry-run.
 """
@@ -26,7 +35,7 @@ import ast
 import asyncio
 import hashlib
 import json
-import random
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -36,22 +45,11 @@ API_PY = REPO_ROOT / "legacy" / "medium-parser" / "medium_parser" / "api.py"
 SMOKE_TESTS = REPO_ROOT / "legacy" / "tests" / "smokie_tests.py"
 GRAPHQL_URL = "https://medium.com/_/graphql"
 
-# Transcribed from `medium_parser/api.py:36-48`. Kept in sync by hand because
-# these are literals there, but `--check-headers` verifies they still match.
-HEADERS = {
-    "Accept": "multipart/mixed; deferSpec=20220824, application/json, application/json",
-    "Accept-Language": "en-US",
-    "X-Obvious-CID": "android",
-    "X-Xsrf-Token": "1",
-    "Cache-Control": "public, max-age=-1",
-    "Content-Type": "application/json",
-    "Connection": "Keep-Alive",
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 15_4_1 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 "
-        "Safari/604.1 (compatible; YandexMobileBot/3.0;"
-    ),
-}
+# The `impersonate=` profile `api.py:75` pins. Overridable with `--impersonate`
+# so that if the Rust candidate has to fall back to another profile, the
+# baseline can be moved to the same one — otherwise a profile change would be
+# measured as a difference between the implementations.
+DEFAULT_IMPERSONATE = "chrome110"
 
 
 def extract_query(api_py: Path = API_PY) -> str:
@@ -76,6 +74,60 @@ def extract_query(api_py: Path = API_PY) -> str:
                         return query
                 sys.exit(f"FATAL: `graphql_data` in {api_py} has no `query` key")
     sys.exit(f"FATAL: could not find the `graphql_data` literal in {api_py}")
+
+
+def extract_header_order(api_py: Path = API_PY) -> list[tuple[str, str | None]]:
+    """Ordered `(name, literal value)` pairs from `api.py`'s `headers = {...}`.
+
+    The value is `None` for headers `api.py` computes per request
+    (`generate_random_sha256_hash()`, `get_unix_ms()`); the caller fills those.
+
+    Order is extracted rather than hand-maintained because it is part of the
+    request bytes the measurement compares. `Cookie` is absent here by design:
+    `api.py:50-51` adds it *outside* the literal, and only when
+    `MEDIUM_AUTH_COOKIES` is set — which the spike never is (§2.7 warning 2).
+    """
+    tree = ast.parse(api_py.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == "headers" for t in node.targets
+        ):
+            continue
+
+        pairs: list[tuple[str, str | None]] = []
+        for key, value in zip(node.value.keys, node.value.values):
+            if not isinstance(key, ast.Constant):
+                sys.exit(f"FATAL: non-literal header name in {api_py}: {ast.dump(key)}")
+            pairs.append(
+                (key.value, value.value if isinstance(value, ast.Constant) else None)
+            )
+        if pairs:
+            return pairs
+
+    sys.exit(f"FATAL: could not find the `headers` literal in {api_py}")
+
+
+def build_headers(ordered: list[tuple[str, str | None]]) -> dict[str, str]:
+    """Fill in the per-request headers, preserving the extracted order.
+
+    The two computed values mirror `medium_parser/utils.py:117` and
+    `medium_parser/time.py:31`: SHA-256 over 32 bytes from the OS entropy source,
+    and epoch milliseconds. An earlier revision used `random.random()` here,
+    which produced a same-shaped but non-production hash.
+    """
+    headers: dict[str, str] = {}
+    for name, literal in ordered:
+        if literal is not None:
+            headers[name] = literal
+        elif name == "X-APOLLO-OPERATION-ID":
+            headers[name] = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        elif name == "X-Client-Date":
+            headers[name] = str(int(time.time() * 1000))
+        else:
+            sys.exit(f"FATAL: {name!r} is computed in api.py and has no counterpart here")
+    return headers
 
 
 def extract_post_id(line: str) -> str | None:
@@ -141,6 +193,17 @@ def load_post_ids(path: Path | None) -> list[str]:
 
 async def run(args: argparse.Namespace) -> int:
     query = extract_query()
+    header_order = extract_header_order()
+    if args.echo_headers:
+        # Printed as the *intended* list, before curl_cffi touches it. Two
+        # caveats for whoever diffs this against the Rust side:
+        #   - `Connection` is present here because `api.py:48` sets it, but it is
+        #     hop-by-hop and curl drops it under HTTP/2. The Rust side omits it
+        #     deliberately, so a one-line difference here is expected, not drift.
+        #   - The two computed values differ every request, so diff the names.
+        print(json.dumps({"header_order": [name for name, _ in header_order]}, indent=2))
+        return 0
+
     post_ids = load_post_ids(Path(args.post_ids) if args.post_ids else None)
     proxies = []
     if args.proxies:
@@ -193,12 +256,7 @@ async def run(args: argparse.Namespace) -> int:
                 "dry_run": True,
             }
 
-        headers = dict(HEADERS)
-        headers["X-APOLLO-OPERATION-ID"] = hashlib.sha256(
-            str(random.random()).encode()
-        ).hexdigest()
-        headers["X-APOLLO-OPERATION-NAME"] = "FullPostQuery"
-        headers["X-Client-Date"] = str(int(time.time() * 1000))
+        headers = build_headers(header_order)
 
         body = {
             "operationName": "FullPostQuery",
@@ -216,7 +274,7 @@ async def run(args: argparse.Namespace) -> int:
                         json=body,
                         proxies={"http": proxy, "https": proxy} if proxy else None,
                         timeout=args.timeout,
-                        impersonate="chrome110",
+                        impersonate=args.impersonate,
                     )
                     elapsed_ms = int((time.monotonic() - started) * 1000)
                     ok = response.status_code == 200
@@ -289,7 +347,7 @@ async def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", required=True, help="JSONL output path")
+    parser.add_argument("--out", help="JSONL output path")
     parser.add_argument("--n", type=int, default=500, help="number of requests")
     parser.add_argument(
         "--proxies", help="file with one socks5:// URL per line (the WARP pool)"
@@ -301,6 +359,15 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=12.0)
     parser.add_argument(
+        "--impersonate",
+        default=DEFAULT_IMPERSONATE,
+        help=(
+            "curl_cffi impersonation profile. Must match the candidate's "
+            f"--emulation, or the comparison measures the profiles (default: "
+            f"{DEFAULT_IMPERSONATE}, which is what api.py:75 pins)"
+        ),
+    )
+    parser.add_argument(
         "--allow-no-proxy",
         action="store_true",
         help="permit an unpoxied baseline (measures something else; for debugging only)",
@@ -310,6 +377,11 @@ def main() -> int:
         action="store_true",
         help="emit the schema with ok=null; validates plumbing, not success rate",
     )
+    parser.add_argument(
+        "--echo-headers",
+        action="store_true",
+        help="print the extracted header order and exit; no network, no --out needed",
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -317,6 +389,8 @@ def main() -> int:
         sys.exit("FATAL: --n must be at least 1")
     if args.concurrency < 1:
         sys.exit("FATAL: --concurrency must be at least 1")
+    if not args.echo_headers and not args.out:
+        parser.error("--out is required unless --echo-headers is given")
 
     return asyncio.run(run(args))
 

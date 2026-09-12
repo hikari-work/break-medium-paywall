@@ -84,6 +84,28 @@ services:
       - local
     environment:
       - "PROXY_LIST=${PROXY_LIST:-}"
+      # The root `.env` carries the *host-run* addresses for the data stores
+      # (`127.0.0.1:5433`, `127.0.0.1:16379`), because that is where
+      # `cargo run -p freedium-web -- server` finds them. Inside a container
+      # those addresses mean the container itself, so they are put back to the
+      # compose service names here. `environment` wins over `env_file`.
+      #
+      # `HOST_ADDRESS` is put back to Caddy's port, which is what the local
+      # profile serves pages from. All four are literal rather than
+      # `${VAR:-default}` on purpose: compose interpolation reads the shell and
+      # a `.env` beside the compose files, **not** the service's `env_file`, so
+      # a `--env-file ../.env` (or an exported `HOST_ADDRESS`) would turn the
+      # override into a no-op and silently change this stack. Literals cannot.
+      #
+      # The four lines are duplicated in `freedium_web` rather than factored
+      # into an anchor, because a service that defines its own `environment:`
+      # **replaces** the anchor's list instead of merging with it — so an
+      # anchor would silently do nothing for exactly the two services that
+      # need it.
+      - "HOST_ADDRESS=http://localhost:6752"
+      - "DATABASE_URL=postgresql://postgres:postgres@postgres_freedium:5432/postgres"
+      - "REDIS_HOST=redis_service"
+      - "REDIS_PORT=6379"
     container_name: freedium_web_mini
     hostname: freedium_web
 
@@ -92,16 +114,184 @@ services:
     profiles:
       - prod
     environment:
-      - "PROXY_LIST=${PROXY_LIST:-socks5://haproxy-pb:1080}"
+      # Until Fase 5, this still points Python straight at the exit HAProxy used
+      # to front: its config had one live backend, `wgcf1:1080`, which is
+      # dante_1 sharing wgcf1's network namespace.
+      - "PROXY_LIST=${PROXY_LIST:-socks5://wgcf1:1080}"
+      # See the note in `freedium_web_mini` above — the root `.env` holds the
+      # host-run values, and these are the in-network ones.
+      - "HOST_ADDRESS=http://localhost:6752"
+      - "DATABASE_URL=postgresql://postgres:postgres@postgres_freedium:5432/postgres"
+      - "REDIS_HOST=redis_service"
+      - "REDIS_PORT=6379"
     depends_on:
-      haproxy-proxy-balancer:
+      # The HAProxy service is gone, but the ordering it provided is not: this
+      # service talks to wgcf1:1080 directly now, so it still waits for the same
+      # healthcheck the balancer transitively waited on.
+      wgcf1:
         condition: service_healthy
     container_name: freedium_web
     hostname: freedium_web
 
+  # --- Fase 4: the shadow pair ----------------------------------------------
+  #
+  # These two exist so the soak can start on tooling that has been run, rather
+  # than on tooling that has only been compiled. Read `edge/README.md` first;
+  # what follows is only what compose adds.
+  #
+  # # Why `local` only, when the plan said `local` and `min`
+  #
+  # Both services are in the **`local`** profile and nowhere else. The reason is
+  # a fact found while wiring them: `freedium-web`'s `AppState::new` completes a
+  # Redis handshake at boot, so a profile running `freedium_web_rust` must also
+  # run a Redis — and `min` has none, by design. Adding one to `min` would change
+  # what that profile *is*, which is not Fase 4's call to make.
+  #
+  # `prod` is held back deliberately (§5: the soak is evidence gathered *before*
+  # the cutover, and putting a new process in the production request path is Fase
+  # 5's decision). `prod` already has Redis, so moving these two lines there is
+  # the whole of that wiring when the time comes.
+  freedium_web_rust:
+    # *Not* `<<: *freedium_web`. That anchor carries the **Python** Dockerfile,
+    # a bind mount of `legacy/web`, and `ports: ["7080:7080"]`. Compose
+    # *concatenates* multi-value keys like `ports` rather than replacing them, so
+    # merging the anchor and overriding `ports` would publish 7080 twice and fail
+    # to bind — the same trap the `freedium_web_mini` note above records for
+    # `environment`, in the other direction. Everything that differs is spelled
+    # out, and nothing that matters is inherited.
+    build:
+      context: ../
+      dockerfile: crates/freedium-web/Dockerfile
+    profiles:
+      - local
+    env_file: ../.env
+    environment:
+      # The same four overrides `freedium_web_mini` applies, for the same reason:
+      # the root `.env` holds host-run addresses, and inside a container those
+      # mean the container. Literals rather than `${VAR:-default}` so an exported
+      # variable in the operator's shell cannot silently retarget this stack.
+      #
+      # `HOST_ADDRESS` **must equal Python's**. It is read at request time and
+      # interpolated into every page, so a mismatch shows up as a difference on
+      # every single article — a false alarm that costs more to diagnose than the
+      # whole run takes. `ENABLE_ADS_BANNER` comes from the shared `env_file` and
+      # is equal for the same reason.
+      - "HOST_ADDRESS=http://localhost:6752"
+      - "DATABASE_URL=postgresql://postgres:postgres@postgres_freedium:5432/postgres"
+      - "REDIS_HOST=redis_service"
+      - "REDIS_PORT=6379"
+      # The interlock. This instance answers a cache miss with a marked 503
+      # instead of calling Medium, so it cannot spend the WARP exit production
+      # is served from (§2.7). It is `true` here and must never be `true` on the
+      # instance serving real users — see `.env_template`.
+      - "SHADOW_MODE=true"
+      # Rebuilding this image does **not** change what it serves. It writes its
+      # rendered HTML to the shared Redis under `v2:post:<id>` with a 5 h TTL
+      # (`freedium-cache/src/keys.rs`), so a rebuilt container goes on answering
+      # with the previous build's renders and the shadow report reads as `PASS`
+      # for a binary that is no longer running. Flush `v2:*` first when the
+      # question is "does the current build agree" — `edge/README.md` has the
+      # command and the run it was found in.
+    # 7081 on the host, 7080 inside. `freedium_web_mini` already publishes 7080,
+    # and the two are meant to be reachable at different addresses so that an
+    # edge pointed at the wrong one is a bind or connection error rather than a
+    # server compared against itself.
+    ports:
+      - "7081:7080"
+    networks:
+      - freedium_net
+    mem_limit: 2g
+    restart: always
+    # `CMD`, not `CMD-SHELL`: the runtime stage is distroless, so there is no
+    # shell to hand a command string to and no `curl` to run. A `CMD-SHELL`
+    # healthcheck in a shell-less image always fails, and `freedium_autoheal`
+    # (`AUTOHEAL_CONTAINER_LABEL=all`) would then restart a healthy container in
+    # a loop. The subcommand sends the same request the Python service's `curl`
+    # does — same `User-Agent`, same 80 s timeout.
+    healthcheck:
+      test: [ "CMD", "/app/freedium-web", "healthcheck" ]
+      interval: 30s
+      start_period: 20s
+      timeout: 90s
+      retries: 3
+    stop_grace_period: 1m
+    container_name: freedium_web_rust
+    # Deliberately *not* the same hostname as `freedium_web_mini`, which sets
+    # `hostname: freedium_web` to match what it is a drop-in for. A shadow that
+    # answers to the same name makes the thing this phase is measuring harder to
+    # see, not easier.
+    hostname: freedium_web_rust
+
+  freedium_edge:
+    build:
+      context: ../
+      dockerfile: edge/Dockerfile
+    profiles:
+      - local
+    environment:
+      # Service names, not the `127.0.0.1` defaults — those are for a host run.
+      - "EDGE_UPSTREAM=freedium_web_mini:7080"
+      - "SHADOW_UPSTREAM=freedium_web_rust:7080"
+      - "EDGE_LISTEN=0.0.0.0:6755"
+      # The kill switch, on. Setting this to false makes the service a plain
+      # pass-through that writes no evidence, which is the rollback.
+      - "SHADOW_ENABLED=true"
+      # Everything eligible is mirrored. §5's soak lowers this from a measurement
+      # of what one extra `cache` read costs; the local proof wants the whole
+      # corpus compared.
+      - "SHADOW_SAMPLE=1"
+      # Set, now that there is something to declare: the `local` profile's corpus
+      # is the fixtures, and one of them (`utf16-mid-surrogate`) is a divergence
+      # the rewrite intends — the legacy parser eats a character whenever a markup
+      # endpoint lands on the second unit of a surrogate pair, and matching that
+      # would mean porting the bug. `edge/shadow-declarations.local.json` holds the
+      # declaration and the full reasoning.
+      #
+      # The `.local` in that name is the point: it names `/e85c9bbaf3fd`, the
+      # synthetic path `gen-shadow-seed` derives from the fixture's *name*, so it
+      # is meaningless against real traffic. §5's soak mounts its own file, naming
+      # the real post ids it has investigated. Pointing this at a file whose paths
+      # never appear is not silently tolerated — a declaration that stops matching
+      # anything is a failure in `shadow-report`, which is the counterweight that
+      # keeps this mechanism from becoming a place to hide differences.
+      - "SHADOW_DECLARATIONS=/data/declarations.json"
+    ports:
+      # 6755, beside Caddy's 6752 rather than in front of it. Repointing Caddy at
+      # this port is the Fase 5 change; this phase proves the machinery without
+      # making it.
+      - "6755:6755"
+    volumes:
+      - freedium_shadow_log:/data
+      # Read-only: the edge parses this at boot and has no business writing it.
+      # Relative paths in a compose file resolve against that file's directory,
+      # which is what the other services' `../legacy/web` bind mounts rely on too.
+      - ../edge/shadow-declarations.local.json:/data/declarations.json:ro
+    networks:
+      - freedium_net
+    mem_limit: 1g
+    restart: always
+    # No healthcheck — see the note in `edge/Dockerfile`. A proxy's self-test
+    # would either be vacuous or would fail whenever the primary is down, and
+    # autoheal restarting the edge would not fix the primary.
+    stop_grace_period: 30s
+    container_name: freedium_edge
+    hostname: freedium_edge
+    depends_on:
+      - freedium_web_mini
+      - freedium_web_rust
+
 volumes:
   freedium_caddy_data:
   freedium_caddy_config:
+  # The soak's evidence. A named volume rather than a bind mount: the process
+  # runs as uid 65532 (`nonroot`), and a bind-mounted host directory would be
+  # root-owned and unwritable. Docker initialises this volume from the image's
+  # `/data`, ownership included.
+  #
+  # To read it: `docker compose -f docker-compose/docker-compose.main.yml cp
+  # freedium_edge:/data/shadow.jsonl .` then point `difftest shadow-report` at
+  # the copy.
+  freedium_shadow_log:
 
 
 networks:

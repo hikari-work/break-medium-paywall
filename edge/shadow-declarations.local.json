@@ -1,0 +1,9 @@
+{
+  "declarations": [
+    {
+      "path": "/e85c9bbaf3fd",
+      "kind": "text-or-markup",
+      "reason": "The `utf16-mid-surrogate` fixture, whose path this is in the seeded local corpus (gen-shadow-seed hashes the fixture name — see `seed_post_id`). The legacy parser corrupts its output when a markup endpoint lands on the second unit of a surrogate pair: it leaves the bang character behind and then deletes it by index after the splice has shifted everything along, so it emits malformed HTML with the first character of the spliced tag eaten. `xtask/difftest/fixtures/utf16-mid-surrogate.json` declares the same divergence for the render gate and says the same thing: this is one of the render bugs the rewrite exists to remove, so the IR snaps to the character boundary and the two sides are expected to differ. Declared rather than fixed because matching the corruption would mean porting the bug."
+    }
+  ]
+}

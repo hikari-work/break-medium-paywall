@@ -1,0 +1,43 @@
+{
+  "name": "page-ads-banner",
+  "note": "`ENABLE_ADS_BANNER=true`, the one fixture that takes the `{% if enable_ads_header %}` branch of `base.html:172` — every other case renders the shell with the branch off, which is production's default (`config.py:29`) and is exactly why the branch needs a case of its own. The banner is a `<div>` of static markup inside `<nav id=\"header\">`, so it is also the fixture that shows whether the surrounding `nav` came out identical when the conditional did fire. The body is an ordinary paragraph so that nothing else in the case can account for a difference.",
+  "host_address": "https://freedium.test",
+  "enable_ads_header": true,
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "A Post With The Ad Banner",
+        "creator": {
+          "id": "creator-1",
+          "name": "Ada Lovelace",
+          "username": "ada",
+          "bio": "Writes about engines.",
+          "imageId": "1*creator"
+        },
+        "collection": {
+          "id": "collection-1",
+          "name": "Analytical Engines",
+          "slug": "analytical-engines",
+          "shortDescription": "A publication about computation.",
+          "avatar": { "id": "1*avatar" }
+        },
+        "mediumUrl": "https://medium.com/@ada/a-post-with-the-ad-banner-0291df856c77",
+        "readingTime": 3,
+        "isLocked": false,
+        "firstPublishedAt": 1692000000000,
+        "updatedAt": 1692000000000,
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [{ "displayTitle": "Rust", "normalizedTagSlug": "rust" }],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Body one.", "name": "p1", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

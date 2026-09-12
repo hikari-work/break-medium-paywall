@@ -8,6 +8,15 @@ services:
       - freedium_net
     profiles:
       - prod
+      # Added in Fase 4, and it is a requirement rather than a convenience:
+      # `freedium-web`'s `AppState::new` completes a Redis handshake
+      # (`RedisStore::connect` → `client.init()`), so the Rust instance cannot
+      # start without a Redis in its profile. Python is lazier — it tolerates a
+      # missing Redis at runtime via `safe_check_redis_connection` — which is why
+      # `local` worked without this line until the shadow arrived. Present in
+      # both profiles also means the two instances share one cache, which is what
+      # makes comparing them a fair test.
+      - local
     volumes:
       - freedium_dragonflydata:/data
     healthcheck:

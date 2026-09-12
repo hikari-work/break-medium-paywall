@@ -1,0 +1,39 @@
+[package]
+name = "freedium-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The Freedium HTTP server. Phase 3 of the Rust rewrite."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Only for the test stubs' `impl PostSource` and `impl LinkResolver`: the traits
+# are `#[async_trait]`, so an implementation has to be too.
+async-trait.workspace = true
+axum = "0.8.9"
+form_urlencoded.workspace = true
+freedium-cache = { version = "0.1.0", path = "../freedium-cache" }
+futures-util = "0.3.34"
+getrandom.workspace = true
+medium-client = { version = "0.1.0", path = "../medium-client" }
+medium-doc = { version = "0.1.0", path = "../medium-doc" }
+medium-render = { version = "0.1.0", path = "../medium-render" }
+# `AppState` holds the built `Environment`, so the type is in this crate's public
+# API even though the templates themselves belong to `medium-render`.
+minijinja.workspace = true
+# The `healthcheck` subcommand's client, and the same one `medium-client`
+# already builds its transport from — so this adds no new tree.
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+subtle = "2.6.1"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+tower = { version = "0.5.3", features = ["util", "timeout"] }
+tower-http = { version = "0.7.1", features = ["fs", "compression-gzip", "compression-br", "timeout", "cors", "trace", "catch-panic"] }
+tracing.workspace = true
+# `env-filter` is not a default feature, and `RUST_LOG` support needs it.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

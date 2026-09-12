@@ -1,0 +1,42 @@
+{
+  "name": "page-long-subtitle",
+  "note": "A subtitle that runs past `width=100`, so the description goes through `textwrap.shorten(subtitle, width=100, placeholder=\"...\")` (core.py:703-705). It carries a `state-of-the-art` compound on purpose: CPython's `break_on_hyphens=True` splits ordinary words at hyphens too, and the truncation point can therefore land *inside* a hyphenated word, which a whitespace split would not do. This fixture is the integration — that `generate_metadata` really routes the subtitle through `shorten`, and that the second escaping pass runs over the shortened result. The truncation mechanics themselves are pinned word for word against CPython by the golden table in `crates/medium-doc/src/textwrap.rs`; there is deliberately no expected value here, because a second hand-maintained copy of what Python produces is a second thing that can be wrong.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "A Post With A Long Subtitle",
+        "creator": {
+          "id": "creator-1",
+          "name": "Ada Lovelace",
+          "username": "ada",
+          "bio": "Writes about engines.",
+          "imageId": "1*creator"
+        },
+        "collection": {
+          "id": "collection-1",
+          "name": "Analytical Engines",
+          "slug": "analytical-engines",
+          "shortDescription": "A publication about computation.",
+          "avatar": { "id": "1*avatar" }
+        },
+        "mediumUrl": "https://medium.com/@ada/a-post-with-a-long-subtitle-0291df856c77",
+        "readingTime": 11,
+        "isLocked": false,
+        "firstPublishedAt": 1692000000000,
+        "updatedAt": 1692000000000,
+        "previewContent": { "subtitle": "A subtitle that is long enough to be shortened, with a state-of-the-art detour and enough further words after it that the hundred column limit forces the placeholder to appear somewhere near the end of it." },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [{ "displayTitle": "Rust", "normalizedTagSlug": "rust" }],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Body one.", "name": "p1", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

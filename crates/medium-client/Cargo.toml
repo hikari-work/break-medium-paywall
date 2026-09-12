@@ -1,0 +1,31 @@
+[package]
+name = "medium-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "TLS-impersonating Medium GraphQL client, in-process proxy pool. Phase 2 of the Rust rewrite."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# `resolver::HttpLinkResolver` implements `medium_doc::resolve::LinkResolver`,
+# so this crate depends on the IR crate and not the other way round — the seam
+# stays with the caller and the network stays with this crate (§2.6).
+medium-doc = { path = "../medium-doc" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+# `generate_random_sha256_hash` (`medium_parser/utils.py:117`) is SHA-256 over 32
+# bytes from `secrets.token_bytes()`.
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+# `generate_random_sha256_hash` returns a hex digest, so the operation id is hex.
+hex = { workspace = true }
+
+[dev-dependencies]

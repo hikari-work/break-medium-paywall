@@ -1,0 +1,42 @@
+{
+  "name": "page-locked",
+  "note": "`isLocked: true` — `free_access` is `\"No\"`, and the template reads `Free: No`. Note the inversion: the *name* is `free_access` but a locked post is the one that is not free, so `\"No\" if isLocked else \"Yes\"` (core.py:712) is the pair to get the right way round. Paired with a fractional `readingTime` so `math.ceil` is exercised at the same time: 4.1 must render as 5, not 4.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "A Member-Only Post",
+        "creator": {
+          "id": "creator-1",
+          "name": "Ada Lovelace",
+          "username": "ada",
+          "bio": "Writes about engines.",
+          "imageId": "1*creator"
+        },
+        "collection": {
+          "id": "collection-1",
+          "name": "Analytical Engines",
+          "slug": "analytical-engines",
+          "shortDescription": "A publication about computation.",
+          "avatar": { "id": "1*avatar" }
+        },
+        "mediumUrl": "https://medium.com/@ada/a-member-only-post-0291df856c77",
+        "readingTime": 4.1,
+        "isLocked": true,
+        "firstPublishedAt": 1692000000000,
+        "updatedAt": 1692000000000,
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [{ "displayTitle": "Rust", "normalizedTagSlug": "rust" }],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Body one.", "name": "p1", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

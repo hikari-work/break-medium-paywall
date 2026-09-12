@@ -12,5 +12,12 @@ workspace = true
 [dependencies]
 medium-doc = { path = "../medium-doc" }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+minijinja = { workspace = true }
+minijinja-embed = { workspace = true }
+
+[build-dependencies]
+minijinja-embed = { workspace = true }
 
 [dev-dependencies]

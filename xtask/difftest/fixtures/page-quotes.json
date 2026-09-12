@@ -1,0 +1,42 @@
+{
+  "name": "page-quotes",
+  "note": "Curly quotes, a straight apostrophe and an ampersand in the *title* and *subtitle*, which reach three different escaping paths in `generate_metadata` (core.py:697-705). `title` is minimal-escaped, so its quotes and apostrophes survive bare. `subtitle` is full-escaped, so `'` becomes `&#39` — with no semicolon, which is the quirk. And `description` escapes the *already-escaped* subtitle, so that `&#39` becomes `&amp;#39`; the escaping is not idempotent and the second pass is the one that proves the first ran. `quote_symbol` normalises the curly forms first, so `’` and `‘` arrive at the escaper as `'`.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "Ada’s “Engines” & the ‘Analytical’ Machine",
+        "creator": {
+          "id": "creator-1",
+          "name": "Ada Lovelace",
+          "username": "ada",
+          "bio": "Writes about engines.",
+          "imageId": "1*creator"
+        },
+        "collection": {
+          "id": "collection-1",
+          "name": "Analytical Engines",
+          "slug": "analytical-engines",
+          "shortDescription": "A publication about computation.",
+          "avatar": { "id": "1*avatar" }
+        },
+        "mediumUrl": "https://medium.com/@ada/adass-engines-0291df856c77",
+        "readingTime": 7,
+        "isLocked": false,
+        "firstPublishedAt": 1692000000000,
+        "updatedAt": 1692000000000,
+        "previewContent": { "subtitle": "It’s a ‘short’ note — with an \"ampersand\" & a \"quote\"" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [{ "displayTitle": "Rust", "normalizedTagSlug": "rust" }],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Body one.", "name": "p1", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

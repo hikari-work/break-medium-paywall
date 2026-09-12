@@ -1,9 +1,10 @@
 //! SPIKE-1 verdict: does the Rust client keep the fetcher working?
 //!
 //! RUST_REWRITE_PLAN §3.1 gates the rewrite on TLS-impersonation parity: the
-//! candidate client (`rquest`, or libcurl-impersonate via FFI) must match the
-//! `curl_cffi` baseline's success rate to within 1% over the same requests
-//! through the same WARP pool.
+//! candidate client (an impersonating HTTP client — `wreq`, the maintained
+//! successor to the `rquest` the plan named) must match the `curl_cffi`
+//! baseline's success rate to within 1% over the same requests through the same
+//! WARP pool.
 //!
 //! This module only scores the two measurement files. It never makes a request,
 //! so it runs anywhere — which matters, because the measurement itself can only
@@ -282,9 +283,21 @@ pub fn report(
     println!();
     if verdict {
         println!(
-            "PASS — the candidate client meets the §3.1 gate. Proceed with `rquest` \
-             (option 1) as the `PostSource`."
+            "PASS — the candidate client meets the §3.1 gate. Proceed with the \
+             impersonating `Transport` (option 1) as the `PostSource`."
         );
+        // The ratio alone can pass while both sides are failing. `baseline_rate`
+        // is printed above for that reason, but it is worth saying outright at
+        // the moment someone reads the verdict and stops reading.
+        if baseline_rate < 0.99 {
+            println!(
+                "       caveat: the baseline itself only reached {:.2}% — read the absolute \
+                 rates above before treating this as a clean pass, and check that both \
+                 sides failed on the same post IDs (the scorer does not compare the two \
+                 files row by row).",
+                baseline_rate * 100.0
+            );
+        }
     } else {
         println!(
             "FAIL — the candidate client does not meet the §3.1 gate. Per the plan, do \

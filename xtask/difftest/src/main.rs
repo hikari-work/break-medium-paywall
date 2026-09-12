@@ -24,11 +24,11 @@
 //! later phase; it needs a corpus dumped from the production `cache` table,
 //! which is not available in this working tree.
 
-mod canonical;
 mod cases;
 mod impersonate;
 mod prng;
 mod render;
+mod shadow;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -79,6 +79,8 @@ fn main() -> ExitCode {
         "gen-render-cases" => cmd_gen_render_cases(&opts),
         "run-render" => cmd_run_render(&opts),
         "spike-impersonate-report" => cmd_spike_impersonate_report(&opts),
+        "gen-shadow-seed" => cmd_gen_shadow_seed(&opts),
+        "shadow-report" => cmd_shadow_report(&opts),
         "help" | "-h" | "--help" => {
             usage();
             ExitCode::SUCCESS
@@ -124,6 +126,25 @@ Commands:
       --threshold defaults to 0.99. --show-proxies adds a per-proxy
       breakdown. Never makes a network request.
 
+  gen-shadow-seed  --database-url <url> [--fixtures <dir>] [--dry-run]
+      Write every fixture's post_data into the `cache` table, so a local
+      shadow run has a corpus with no network. Each fixture is stored
+      under a 12-hex key derived from its *name*, not from its post_id:
+      all of the fixtures share one post_id, so seeding by that would
+      write a single row. Prints the table either way.
+      --fixtures defaults to `xtask/difftest/fixtures`.
+      --dry-run walks the corpus and prints it without writing.
+
+  shadow-report  --log <path> [--declarations <file>] [--min-days <n>]
+                 [--show <n>]
+      Score a Fase 4 shadow log (SHADOW_LOG, one JSONL record per request).
+      Exits non-zero on an undeclared difference, on a declaration that
+      never fired, on fewer than --min-days consecutive clean days, and on
+      a log too thin to have caught a broken edge (the degeneracy report).
+      --declarations should be the file the edge ran with
+      (SHADOW_DECLARATIONS); without it, dead declarations are not checked.
+      --min-days defaults to 7, which is §5's gate.
+
   help
 "
     );
@@ -151,6 +172,101 @@ fn cmd_spike_impersonate_report(opts: &Options) -> ExitCode {
     let show_proxies = opts.has("show-proxies");
 
     match impersonate::report(baseline, candidate, threshold, show_proxies) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Seeds the `cache` table from the fixture corpus, for §6's local run.
+///
+/// The corpus *is* the render gate's fixtures — real GraphQL responses already on
+/// disk — rather than a second corpus invented here. See `shadow::seed_post_id`
+/// for why the key is derived from the fixture's name.
+fn cmd_gen_shadow_seed(opts: &Options) -> ExitCode {
+    let Some(database_url) = opts.get("database-url") else {
+        eprintln!("error: gen-shadow-seed requires --database-url <postgres url>");
+        return ExitCode::FAILURE;
+    };
+    let dir = opts.get("fixtures").unwrap_or(DEFAULT_FIXTURES_DIR);
+    let dry_run = opts.has("dry-run");
+
+    // Built here rather than with `#[tokio::main]` on `main`, so that every
+    // other subcommand stays a plain synchronous program. This is the only one
+    // that touches a database, and it should not make the rest carry a reactor.
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("error: cannot start a tokio runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let seeded = match runtime.block_on(shadow::seed(dir, database_url, dry_run)) {
+        Ok(seeded) => seeded,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The mapping, printed unconditionally: it is what lets a request in a shadow
+    // report be traced back to the fixture that produced it, and a diff that
+    // named a fixture would otherwise be the only thing anyone had.
+    println!(
+        "{}{} fixture(s) from {dir}",
+        if dry_run { "would seed " } else { "seeded " },
+        seeded.paths.len()
+    );
+    println!();
+    println!("{:<24} {:<14} request", "fixture", "cache key");
+    for (name, path) in &seeded.paths {
+        // The key is the path without its leading slash. Printed on the same row
+        // as the fixture so the two are read together.
+        println!("{:<24} {:<14} {path}", name, &path[1..]);
+    }
+    println!();
+    println!("{} byte(s) of post_data in total", seeded.bytes);
+    if dry_run {
+        println!(
+            "nothing was written: --dry-run. Drop it to seed, pointing --database-url at the \
+             database both instances share."
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Reads Fase 4's shadow log and applies §5's gate. See `shadow::report`.
+fn cmd_shadow_report(opts: &Options) -> ExitCode {
+    let Some(log) = opts.get("log") else {
+        eprintln!("error: shadow-report requires --log <path>");
+        return ExitCode::FAILURE;
+    };
+    let min_days: u32 = match opts.get("min-days").map(str::parse) {
+        Some(Ok(days)) if days > 0 => days,
+        Some(Ok(_)) => {
+            eprintln!("error: --min-days must be at least 1");
+            return ExitCode::FAILURE;
+        }
+        Some(Err(err)) => {
+            eprintln!("error: --min-days: {err}");
+            return ExitCode::FAILURE;
+        }
+        None => shadow::DEFAULT_MIN_DAYS,
+    };
+    let show: usize = match opts.get("show").map(str::parse) {
+        Some(Ok(show)) => show,
+        Some(Err(err)) => {
+            eprintln!("error: --show: {err}");
+            return ExitCode::FAILURE;
+        }
+        None => shadow::DEFAULT_SHOW,
+    };
+
+    match shadow::report(log, opts.get("declarations"), min_days, show) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(err) => {

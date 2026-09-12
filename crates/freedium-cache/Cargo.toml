@@ -1,0 +1,29 @@
+[package]
+name = "freedium-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Postgres and Redis backends for Freedium. Phase 2 of the Rust rewrite."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+sqlx = { workspace = true }
+fred = { workspace = true }
+rmp-serde = { workspace = true }
+# Only for the `\x` hex workaround in `decode`. See that module for why the
+# legacy code cannot be replaced by a plain JSON parse.
+hex = { workspace = true }
+
+[dev-dependencies]
+# `RenderedPost` lives in `medium-render` so this crate stays ignorant of
+# rendering; the dev-dependency is what lets the cache's payload-layout test
+# name the real type instead of a stand-in that could drift from it.
+medium-render = { path = "../medium-render" }

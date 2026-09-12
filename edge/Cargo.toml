@@ -1,0 +1,32 @@
+# `edge/` — its own cargo workspace
+#
+# RUST_REWRITE_PLAN §2.6 and §3.4: the edge is a separate workspace with its own
+# `Cargo.lock`, so that nothing it pulls in can reach the main workspace's
+# dependency graph. The root manifest records the same reasoning for
+# `xtask/spike-impersonate`.
+#
+# What that buys, concretely, for a Pingora edge: SPIKE-3's `boring-sys` /
+# `openssl-sys` version conflict with `rquest`/`wreq` cannot arise, because the
+# two never share a lockfile. See `README.md` for what it costs.
+#
+# The root workspace's `members` are `crates/*` and `xtask/*`, so `edge/` is not
+# matched by either — it is its own root because of the `[workspace]` table
+# below, not because it is excluded. It is listed in the root's `exclude` anyway,
+# so the intent is written down where someone reading the root will find it.
+[workspace]
+resolver = "3"
+members = ["freedium-edge"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# The main workspace's floor, restated literally because nothing here inherits
+# from it. Kept in step deliberately: a crate that builds in one workspace and
+# not the other is a toolchain question nobody wants to debug twice.
+rust-version = "1.98"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

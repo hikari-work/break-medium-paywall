@@ -157,7 +157,7 @@ cython_debug/
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+.idea/
 
 **/user_data/
 *.dist/
@@ -181,4 +181,17 @@ postgres/
 # SPIKE-1 measurement logs and the proxy pool file. These hold live WARP egress
 # endpoints; keep them out of the repository.
 /xtask/spike-impersonate/*.jsonl
+/xtask/spike-impersonate/*.meta.json
 /xtask/spike-impersonate/proxies.txt
+# The spike's Cargo.lock is deliberately NOT ignored, unlike the JSONL above: for
+# a measurement, the pinned `wreq`/`boring` revisions are part of the result.
+
+# Fase 4's shadow log. It is a record of one run against one corpus, not a source
+# file — a soak's real log is the evidence for a gate, and it belongs wherever
+# that gate is read, not in the tree.
+/edge/shadow.jsonl
+
+# Not source: `medium_parser/api.py:85` writes the last raw GraphQL response here
+# on every fetch, so the file is whatever the last local run happened to fetch.
+# It was never tracked, on any branch.
+/legacy/web/sidufh.json

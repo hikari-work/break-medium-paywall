@@ -114,6 +114,21 @@ fn nullable_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::
     Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// A millisecond timestamp, however the API chose to type it.
+///
+/// The schema says `Int`, so the `as_f64` arm is insurance rather than a live
+/// path. The cost of being wrong without it is not a lost date but a lost
+/// article: a deserialisation failure inside [`PostPayload::post`] discards the
+/// whole `Post`, and every other field with it.
+fn nullable_timestamp<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|millis| millis as i64))
+    }))
+}
+
 /// A dimension, as Medium's schema types it (`Int`).
 ///
 /// Read through [`Value::as_u64`] so that a payload sending a float or a string
@@ -149,6 +164,12 @@ pub struct Post {
     /// `math.ceil` is applied later (`core.py:711`), so this arrives fractional.
     #[serde(default)]
     pub reading_time: Option<f64>,
+    /// Milliseconds since the Unix epoch; `core.py:713` divides by 1000.
+    #[serde(default, deserialize_with = "nullable_timestamp")]
+    pub updated_at: Option<i64>,
+    /// See [`Post::updated_at`].
+    #[serde(default, deserialize_with = "nullable_timestamp")]
+    pub first_published_at: Option<i64>,
     #[serde(default, deserialize_with = "nullable_bool")]
     pub is_locked: bool,
     /// Kept as raw JSON until Fase 6 defines the public DTO (§2.7).
@@ -828,13 +849,14 @@ impl Parser<'_> {
 
         // A `__ref` is followed only when it is not accompanied by the data it
         // points at (`core.py:615`).
-        if let Some(reference) = resource.reference.clone() {
-            if resource.id.is_none() && resource.iframe_src.is_none() {
-                debug!(reference, "following a media resource reference");
-                match self.payload.media_resource(&reference) {
-                    Some(found) => resource = found,
-                    None => warn!(reference, "no media resource for that reference"),
-                }
+        if let Some(reference) = resource.reference.clone()
+            && resource.id.is_none()
+            && resource.iframe_src.is_none()
+        {
+            debug!(reference, "following a media resource reference");
+            match self.payload.media_resource(&reference) {
+                Some(found) => resource = found,
+                None => warn!(reference, "no media resource for that reference"),
             }
         }
 

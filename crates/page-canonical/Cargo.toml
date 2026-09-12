@@ -1,0 +1,19 @@
+[package]
+name = "page-canonical"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The canonical form rendered pages are compared in, shared by the render gate and the shadow edge."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The HTML parser behind canonicalization. It is the only dependency here, and
+# it is deliberately not a dependency of anything that ships a page — see the
+# module docs in `canonical.rs`.
+html5ever = { workspace = true }
+markup5ever_rcdom = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

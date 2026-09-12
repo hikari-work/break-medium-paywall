@@ -1,0 +1,584 @@
+//! Fetching a post: request construction, the transport, and the retry loop.
+//!
+//! # What this is, and what it deliberately is not
+//!
+//! Everything in the path is here and complete — headers, body, proxy
+//! selection, timeouts, retry, failure classification — except the one thing
+//! §3.1 is still deciding: **how the request is made**. That sits behind
+//! [`Transport`].
+//!
+//! The reason to build it this way rather than wait is that the impersonation
+//! question is genuinely narrow. It is not "can this client talk to Medium", it
+//! is "does this client's TLS ClientHello and HTTP/2 frame ordering look like
+//! Chrome 110". Everything around that is answerable now, and is tested now,
+//! against a stub server.
+//!
+//! # [`ReqwestTransport`] will not get past Medium's bot check
+//!
+//! It is not meant to. `reqwest` uses the system TLS stack with its own
+//! fingerprint, and `medium.com/_/graphql` rejects that. What it *is* for is
+//! running the whole request path end to end in tests and in development, so
+//! that when the SPIKE-1 verdict lands, the diff is a new `Transport`
+//! implementation and nothing else.
+//!
+//! Do not ship it as the production source. §3.1's decision tree — `rquest`,
+//! then libcurl-impersonate via FFI, then a Python sidecar — is unresolved and
+//! `xtask/spike-impersonate/README.md` records it as blocked.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::Value;
+
+use crate::error::{FetchError, TransportError};
+use crate::proxy::{ProxyChoice, ProxyClients, ProxyPool};
+use crate::request;
+use crate::response;
+use crate::retry::{RetryPolicy, Sleeper, TokioSleeper, with_retry};
+use crate::source::PostSource;
+
+/// The verb a [`TransportRequest`] carries.
+///
+/// Not `http::Method`: the same reasoning as [`TransportRequest`] itself. Two
+/// verbs are all the server needs — GraphQL is a POST and the two passthrough
+/// fetches are GETs — and an enum that cannot express a third is a smaller thing
+/// for §3.1's sidecar to translate than an arbitrary token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Method {
+    Get,
+    /// The default: a `TransportRequest` built without one is the GraphQL call,
+    /// which is what this crate existed for before the resolver and the media
+    /// fetcher were added.
+    #[default]
+    Post,
+}
+
+/// A request, in the terms every transport can express.
+///
+/// Deliberately not `http::Request`: the third §3.1 candidate is a Python
+/// sidecar reached over HTTP, which would have to translate this into its own
+/// shape anyway. A plain struct makes that translation the sidecar's business
+/// instead of forcing an HTTP-shaped API onto it.
+#[derive(Debug, Clone)]
+pub struct TransportRequest {
+    pub url: String,
+    pub method: Method,
+    pub headers: Vec<(String, String)>,
+    /// Sent only for [`Method::Post`]. A GET must not carry a body, and a
+    /// transport that sent one anyway would have `reqwest` turn it into an
+    /// error rather than a request.
+    pub body: Vec<u8>,
+    /// `None` sends the request directly.
+    pub proxy: Option<String>,
+    pub timeout: Duration,
+}
+
+impl TransportRequest {
+    /// A GET with no body — the shape both passthrough fetches need.
+    pub fn get(url: impl Into<String>, headers: Vec<(String, String)>) -> Self {
+        Self {
+            url: url.into(),
+            method: Method::Get,
+            headers,
+            body: Vec::new(),
+            proxy: None,
+            timeout: Duration::from_secs(12),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransportResponse {
+    pub status: u16,
+    /// Response headers, in the order the server sent them, with the names
+    /// lowercased as `reqwest` normalises them.
+    ///
+    /// The resolver reads `Location` and the media fetcher reads
+    /// `Content-Type`, so a response that carries neither is incomplete rather
+    /// than wrong. Both lookups go through [`Self::header`] so that a
+    /// transport which reports names in their original case still works.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl TransportResponse {
+    /// The first value for `name`, case-insensitively.
+    ///
+    /// First, not last: a duplicate `Content-Type` is malformed and the legacy
+    /// client's `request.headers["Content-Type"]` would have raised on it. The
+    /// distinction does not matter for a well-formed response and this is the
+    /// more predictable reading for a broken one.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// How bytes get to Medium.
+///
+/// See the module doc: this is the seam SPIKE-1 decides.
+#[async_trait]
+pub trait Transport: Send + Sync {
+    async fn send(&self, request: TransportRequest) -> Result<TransportResponse, TransportError>;
+}
+
+/// An HTTP transport with no impersonation. See the module doc before using it
+/// outside tests.
+///
+/// Clients are kept per proxy by [`ProxyClients`] — `reqwest` 0.13 sets a proxy
+/// on the client rather than the request, and one client per exit is also the
+/// right shape when the pool rotates between requests.
+#[derive(Debug, Clone, Default)]
+pub struct ReqwestTransport {
+    clients: ProxyClients,
+}
+
+impl ReqwestTransport {
+    /// Builds the direct client eagerly, so a TLS configuration failure is
+    /// reported here rather than on the first request.
+    pub fn new() -> Result<Self, TransportError> {
+        let transport = Self::default();
+        transport.client_for(None)?;
+        Ok(transport)
+    }
+
+    fn client_for(&self, proxy: Option<&str>) -> Result<reqwest::Client, TransportError> {
+        self.clients.get_or_build(proxy, |builder| {
+            // Redirects are followed by default. Medium's GraphQL endpoint is
+            // not expected to redirect, and following one would turn a clear
+            // status-code failure into a confusing body parse.
+            builder.redirect(reqwest::redirect::Policy::none())
+        })
+    }
+}
+
+#[async_trait]
+impl Transport for ReqwestTransport {
+    async fn send(&self, request: TransportRequest) -> Result<TransportResponse, TransportError> {
+        let used_proxy = request.proxy.is_some();
+        let client = self.client_for(request.proxy.as_deref())?;
+
+        let mut builder = match request.method {
+            Method::Get => client.get(&request.url),
+            Method::Post => client.post(&request.url).body(request.body),
+        };
+        // Per-request, so one caller's timeout does not become the next
+        // caller's too.
+        builder = builder.timeout(request.timeout);
+
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|err| classify(&err, used_proxy))?;
+
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    // A header value that is not UTF-8 is not something either
+                    // caller can use, and dropping it here beats failing the
+                    // whole request over an unrelated header.
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| classify(&err, used_proxy))?
+            .to_vec();
+
+        Ok(TransportResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+/// Turns a `reqwest` error into the crate's own.
+///
+/// `used_proxy` is the heuristic that matters: `reqwest` cannot say whether a
+/// connection failure was the proxy's fault, but if a proxy was configured and
+/// the connection failed, blaming the proxy is both the likely explanation and
+/// the useful one — it is what makes the pool eject the exit and retry
+/// elsewhere.
+fn classify(err: &reqwest::Error, used_proxy: bool) -> TransportError {
+    if err.is_timeout() {
+        TransportError::Timeout
+    } else if used_proxy && (err.is_connect() || err.is_request()) {
+        TransportError::Proxy(err.to_string())
+    } else {
+        TransportError::Other(err.to_string())
+    }
+}
+
+/// A [`PostSource`] that fetches from Medium over a [`Transport`].
+pub struct HttpPostSource<T: Transport> {
+    transport: T,
+    pool: Arc<ProxyPool>,
+    endpoint: String,
+    policy: RetryPolicy,
+    sleeper: Arc<dyn Sleeper>,
+    auth_cookies: Option<String>,
+    timeout: Duration,
+}
+
+impl<T: Transport> HttpPostSource<T> {
+    /// `timeout` defaults to `REQUEST_TIMEOUT` (`config.py:20`, twelve
+    /// seconds) and the retry policy to [`RetryPolicy::DEFAULT`].
+    pub fn new(transport: T, pool: Arc<ProxyPool>) -> Self {
+        Self {
+            transport,
+            pool,
+            endpoint: request::ENDPOINT.to_string(),
+            policy: RetryPolicy::DEFAULT,
+            sleeper: Arc::new(TokioSleeper),
+            auth_cookies: None,
+            timeout: Duration::from_secs(12),
+        }
+    }
+
+    pub fn with_policy(mut self, policy: RetryPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_sleeper(mut self, sleeper: Arc<dyn Sleeper>) -> Self {
+        self.sleeper = sleeper;
+        self
+    }
+
+    /// The `Cookie` header. Read §2.7 warning 2 before setting this in
+    /// production: it is a subscriber account's session, and its unlocks are
+    /// quota-bound.
+    pub fn with_auth_cookies(mut self, auth_cookies: Option<String>) -> Self {
+        self.auth_cookies = auth_cookies;
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Points the source somewhere other than `medium.com/_/graphql`. For
+    /// tests, and for the sidecar in §3.1 option 3, which is reached at its own
+    /// address.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// One attempt: pick an exit, send, and interpret the response.
+    ///
+    /// Ejecting the proxy on a transport failure happens *here* rather than in
+    /// the retry loop, because the pool is this method's business and because
+    /// the next call to [`ProxyPool::next`] is what picks the replacement.
+    async fn attempt(&self, post_id: &str, attempt: u32) -> Result<Value, FetchError> {
+        let choice = self.pool.next()?;
+
+        let proxy = match &choice {
+            ProxyChoice::Direct => None,
+            ProxyChoice::Via(endpoint) => Some(endpoint.as_str().to_string()),
+        };
+        tracing::debug!(post_id, attempt, ?proxy, "fetching post");
+
+        let body = serde_json::to_vec(&request::body(post_id))
+            .map_err(|err| FetchError::Malformed(err.to_string()))?;
+
+        let transport_request = TransportRequest {
+            url: self.endpoint.clone(),
+            method: Method::Post,
+            headers: request::headers(
+                &request::operation_id(),
+                request::client_date_ms(),
+                self.auth_cookies.as_deref(),
+            ),
+            body,
+            proxy,
+            timeout: self.timeout,
+        };
+
+        let response = match self.transport.send(transport_request).await {
+            Ok(response) => response,
+            Err(err) => {
+                // Take the exit out of rotation before returning, so the retry
+                // (which calls `next` again) goes somewhere else. This is the
+                // capability HAProxy does not have — see `proxy.rs`.
+                if let ProxyChoice::Via(endpoint) = &choice {
+                    self.pool.eject(endpoint);
+                }
+                return Err(FetchError::Transport(err));
+            }
+        };
+
+        if response.status != 200 {
+            return Err(FetchError::Status {
+                status: response.status,
+                body: preview(&response.body),
+            });
+        }
+
+        let payload: Value = serde_json::from_slice(&response.body)
+            .map_err(|err| FetchError::BadBody(err.to_string()))?;
+
+        response::validate(&payload)?;
+        Ok(payload)
+    }
+}
+
+#[async_trait]
+impl<T: Transport + 'static> PostSource for HttpPostSource<T> {
+    async fn fetch_post(&self, post_id: &str) -> Result<Value, FetchError> {
+        with_retry(self.policy, self.sleeper.as_ref(), |attempt| {
+            self.attempt(post_id, attempt)
+        })
+        .await
+    }
+}
+
+/// A character-safe prefix of a response body, for the `Status` error.
+///
+/// The body of a rejected GraphQL request is small, but a proxy or CDN error
+/// page can be tens of kilobytes, and the error ends up in logs.
+fn preview(body: &[u8]) -> String {
+    const LIMIT: usize = 300;
+
+    let text = String::from_utf8_lossy(body);
+    if text.chars().count() <= LIMIT {
+        return text.into_owned();
+    }
+
+    let cut = text
+        .char_indices()
+        .nth(LIMIT)
+        .map(|(index, _)| index)
+        .expect("counted more than LIMIT characters");
+    format!("{}…", &text[..cut])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::ProxyEndpoint;
+    use crate::test_support::{
+        AlwaysHealthy, Behaviour, CountingSleeper, Stub, direct_pool, http_ok, http_status,
+    };
+    use std::time::Duration;
+
+    fn source(endpoint: &str) -> HttpPostSource<ReqwestTransport> {
+        HttpPostSource::new(
+            ReqwestTransport::new().expect("the transport builds"),
+            direct_pool(),
+        )
+        .with_endpoint(endpoint)
+        .with_timeout(Duration::from_secs(5))
+    }
+
+    const VALID: &str = r#"{"data":{"post":{"id":"abc"}}}"#;
+
+    #[tokio::test]
+    async fn a_valid_response_is_returned() {
+        let stub = Stub::serving(VALID);
+        let payload = source(&stub.url).fetch_post("abc").await.unwrap();
+        assert_eq!(payload["data"]["post"]["id"], "abc");
+    }
+
+    /// The request must actually reach the wire as the legacy client sends it —
+    /// a stub that answers the same way whatever it is sent would pass every
+    /// other test in this module.
+    #[tokio::test]
+    async fn the_request_carries_the_query_body() {
+        let stub = Stub::serving(VALID);
+        source(&stub.url).fetch_post("515dd5a43948").await.unwrap();
+
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 1, "one fetch, one request");
+        let request = &requests[0];
+        // hyper lowercases header names on the wire, so compare that way.
+        let lowercased = request.to_ascii_lowercase();
+
+        assert!(
+            request.starts_with("POST / HTTP/1.1\r\n"),
+            "got {request:?}"
+        );
+        assert!(
+            lowercased.contains("x-apollo-operation-name: fullpostquery\r\n"),
+            "got {request:?}"
+        );
+        assert!(
+            lowercased.contains(&format!(
+                "user-agent: {}\r\n",
+                request::USER_AGENT.to_ascii_lowercase()
+            )),
+            "got {request:?}"
+        );
+
+        let body = request
+            .split_once("\r\n\r\n")
+            .expect("a body follows the headers")
+            .1;
+        let sent: Value = serde_json::from_str(body).expect("the body is the JSON request");
+
+        assert_eq!(sent["operationName"], "FullPostQuery");
+        assert_eq!(sent["variables"]["postId"], "515dd5a43948");
+        assert_eq!(sent["query"], request::FULL_POST_QUERY);
+    }
+
+    /// No `Cookie` header unless one was configured — §2.7 warning 2 makes an
+    /// accidentally-attached subscriber session an expensive mistake.
+    #[tokio::test]
+    async fn the_cookie_header_is_absent_by_default() {
+        let stub = Stub::serving(VALID);
+        source(&stub.url).fetch_post("abc").await.unwrap();
+
+        let requests = stub.requests();
+        assert!(!requests[0].contains("Cookie:"), "got {:?}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn a_non_200_is_a_status_error() {
+        let stub = Stub::start(vec![Behaviour::Reply(http_status(
+            403,
+            "Forbidden",
+            "nope",
+        ))]);
+        let err = source(&stub.url).fetch_post("abc").await.unwrap_err();
+
+        match err {
+            FetchError::Status { status, body } => {
+                assert_eq!(status, 403);
+                assert_eq!(body, "nope");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    /// A 200 with no post is terminal: Medium answered, and asking again gets
+    /// the same answer.
+    #[tokio::test]
+    async fn a_200_without_a_post_is_terminal() {
+        let stub = Stub::serving(r#"{"data":{"post":null}}"#);
+
+        let sleeper = Arc::new(CountingSleeper::default());
+        let source = source(&stub.url).with_sleeper(sleeper.clone());
+
+        assert_eq!(source.fetch_post("abc").await, Err(FetchError::NoPost));
+        assert_eq!(sleeper.calls(), 0, "a terminal failure must not retry");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_json_is_a_bad_body() {
+        let stub = Stub::serving("<html>gateway error</html>");
+        assert!(matches!(
+            source(&stub.url).fetch_post("abc").await,
+            Err(FetchError::BadBody(_))
+        ));
+    }
+
+    /// The failing exit is ejected and the retry goes out again — here it
+    /// succeeds, which is the whole premise of moving the pool in-process.
+    #[tokio::test]
+    async fn a_non_200_twice_is_retried_then_reported() {
+        let stub = Stub::start(vec![
+            Behaviour::Reply(http_status(500, "Server Error", "boom")),
+            Behaviour::Reply(http_ok(VALID)),
+        ]);
+
+        let sleeper = Arc::new(CountingSleeper::default());
+        let payload = source(&stub.url)
+            .with_sleeper(sleeper.clone())
+            .fetch_post("abc")
+            .await
+            .unwrap();
+
+        assert_eq!(payload["data"]["post"]["id"], "abc");
+        assert_eq!(sleeper.calls(), 1, "one sleep between two attempts");
+    }
+
+    /// A hung endpoint must surface as a retryable timeout rather than hanging
+    /// the caller forever.
+    #[tokio::test]
+    async fn a_hanging_endpoint_times_out() {
+        let stub = Stub::start(vec![Behaviour::Hang]);
+        let source = HttpPostSource::new(ReqwestTransport::new().unwrap(), direct_pool())
+            .with_endpoint(&stub.url)
+            .with_timeout(Duration::from_millis(200))
+            .with_policy(RetryPolicy::new(1, Duration::from_millis(1)));
+
+        let err = source.fetch_post("abc").await.unwrap_err();
+        assert!(
+            matches!(err, FetchError::Transport(TransportError::Timeout)),
+            "expected a timeout, got {err:?}"
+        );
+    }
+
+    /// A failing transport must eject its exit, so the retry picks another.
+    #[tokio::test]
+    async fn a_transport_failure_ejects_the_proxy() {
+        struct FailingTransport;
+
+        #[async_trait]
+        impl Transport for FailingTransport {
+            async fn send(
+                &self,
+                _request: TransportRequest,
+            ) -> Result<TransportResponse, TransportError> {
+                Err(TransportError::Proxy("connection refused".into()))
+            }
+        }
+
+        let pool = Arc::new(ProxyPool::new(
+            vec![
+                ProxyEndpoint::new("socks5://wgcf1:1080"),
+                ProxyEndpoint::new("socks5://wgcf2:1080"),
+            ],
+            Arc::new(AlwaysHealthy),
+        ));
+
+        let source = HttpPostSource::new(FailingTransport, Arc::clone(&pool))
+            .with_policy(RetryPolicy::new(2, Duration::from_millis(1)))
+            .with_sleeper(Arc::new(CountingSleeper::default()))
+            .with_endpoint("http://127.0.0.1:1");
+
+        let err = source.fetch_post("abc").await.unwrap_err();
+        assert!(matches!(err, FetchError::Transport(_)));
+        assert_eq!(
+            pool.healthy_count(),
+            0,
+            "both exits should have been ejected"
+        );
+    }
+
+    /// A body far larger than the preview limit must not panic on a character
+    /// boundary.
+    #[test]
+    fn preview_bounds_long_bodies() {
+        let long = "😀".repeat(1000);
+        let shown = preview(long.as_bytes());
+        assert_eq!(shown.chars().count(), 301);
+        assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn preview_keeps_short_bodies() {
+        assert_eq!(preview(b"nope"), "nope");
+    }
+
+    /// Invalid UTF-8 in an error page must not panic either.
+    #[test]
+    fn preview_tolerates_invalid_utf8() {
+        assert!(preview(&[0xff, 0xfe]).contains('\u{fffd}'));
+    }
+}

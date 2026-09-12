@@ -1,0 +1,79 @@
+[package]
+name = "freedium-edge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The Fase 4 Pingora edge: a pass-through that mirrors sampled traffic onto the Rust server and compares the two answers."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# `#[async_trait]`, and it is not optional: Pingora 0.8.1's `ProxyHttp` is
+# `#[cfg_attr(not(doc_async_trait), async_trait)]`, so its async methods are
+# desugared into boxed futures with bounds the compiler will not match against a
+# plain `async fn` in an impl. The error is `E0195: lifetime parameters or bounds
+# on method ... do not match the trait declaration`, which reads like a lifetime
+# problem and is not one. Version 0.1 to match pingora-core's own `0.1.42`
+# floor.
+async-trait = "0.1"
+
+# The comparator, the shared record format and the canonical form. By path and
+# across workspaces: `page-canonical` lives in the main workspace and is
+# rebuilt here under this workspace's lockfile. That is the point of decision 5 —
+# the edge and the render gate must not be able to disagree about what a
+# difference is.
+page-canonical = { path = "../../crates/page-canonical" }
+
+# Pinned to 0.8.1, NOT 0.9.0 (decision 6). 0.9.0 shipped 2026-09-04 with
+# reworked connection pooling and a Prometheus crate split, and Pingora is
+# explicitly breaking pre-1.0. A first edge whose whole job is to be a
+# trustworthy pass-through is not where that gets absorbed. Bump it when there
+# is a reason to, not by default.
+#
+# `proxy` and no TLS feature: TLS terminates outside the edge (§2.8 — Caddy does
+# it), so this process only ever speaks plain HTTP to a peer that Caddy fronts.
+# That is decision 7 amended: the plan said "rustls, not BoringSSL", and it turns
+# out Pingora 0.8 has no rustls provider at all — the choice is BoringSSL,
+# OpenSSL, or *neither*. Neither is what a plain-HTTP edge wants, and it resolves
+# SPIKE-3 more completely than rustls would have: no C++ toolchain, no OpenSSL
+# headers, no version question at all.
+pingora = { version = "=0.8.1", features = ["proxy"] }
+
+# `response_body_filter` hands the body over as `&mut Option<Bytes>`, so the type
+# has to be nameable here.
+bytes = "1"
+
+# The header map type the hooks read and write. Both Pingora and reqwest are on
+# `http` 1.x, so this unifies with the map inside `RequestHeader` rather than
+# introducing a second version that would need converting between — which is why
+# the edge can read the client's headers and hand them to reqwest without a
+# translation layer. A future major bump on either side breaks this build, which
+# is the loud version of that coupling.
+http = "1"
+
+# The shadow request. Plain HTTP to the Rust instance, so no TLS backend is
+# wanted and none is enabled. Note what is *not* here and why:
+#
+# - no `http2`: reqwest 0.13 has no `http1` feature because HTTP/1 is
+#   unconditional; h2 is the opt-in. Leaving it off keeps the shadow request as
+#   close to the client's as this client can make it. The peer is an axum server
+#   that Caddy would negotiate h2 with in production, which is a difference worth
+#   not introducing into the comparison.
+# - no `default-tls`, `rustls-tls` or `native-tls`: there is no TLS in this hop,
+#   and pulling one in would add a toolchain question to a workspace that exists
+#   partly to avoid one.
+# - no `gzip`/`brotli`: an encoded primary is *excluded* rather than
+#   misconcluded — see `eligibility::encoding_allows_comparison` — and a shadow
+#   client that could decode would only hide half of that asymmetry.
+reqwest = { version = "0.13", default-features = false }
+
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = "0.1"
+# `env-filter` is not a default feature and `RUST_LOG` needs it. The same
+# subscriber `freedium-web` installs, for the same reason: an operator who
+# already knows how to raise the verbosity of the server should not have to
+# learn a second scheme for the edge.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

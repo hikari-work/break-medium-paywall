@@ -14,8 +14,14 @@ medium-doc = { path = "../../crates/medium-doc" }
 medium-render = { path = "../../crates/medium-render" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# The render gate's normaliser. Both sides are canonicalised by this one
-# implementation, so it is a build dependency of the harness and not of any
-# crate that ships.
-html5ever = { workspace = true }
-markup5ever_rcdom = { workspace = true }
+# The render gate's normaliser and the shadow comparator. Both sides are
+# canonicalised by this one implementation, so it is a build dependency of the
+# harness and not of any crate that ships. It moved out of this crate in Fase 4
+# so the Pingora edge — which lives in its own workspace (RUST_REWRITE_PLAN
+# §3.4) — can compare the same way rather than growing a second implementation.
+page-canonical = { path = "../../crates/page-canonical" }
+# `gen-shadow-seed` writes the local corpus into the shared `cache` table
+# (`RUST_REWRITE_PLAN` §6), which is the one subcommand here that reaches a
+# database. Everything else in this harness reads files.
+freedium-cache = { path = "../../crates/freedium-cache" }
+tokio = { workspace = true }

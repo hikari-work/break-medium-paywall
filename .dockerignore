@@ -75,6 +75,26 @@ docs/_build/
 .pybuilder/
 target/
 
+# Rust build directories that are **not** the workspace root's.
+#
+# `target/` above is anchored: dockerignore patterns are matched against the
+# path relative to the context root, so it excludes `./target` and nothing else.
+# Three of this repository's cargo targets are somewhere else — `edge/` and
+# `xtask/spike-impersonate/` are workspaces of their own (RUST_REWRITE_PLAN §3.4)
+# and have their own `target/`, and `cargo build` run inside either of them
+# creates one there. Unmeasured, that is the difference between a build context of
+# about 100 MB and one of 2.4 GB, sent on every build of both `edge/Dockerfile`
+# and `crates/freedium-web/Dockerfile`.
+#
+# It is not only slow. `edge/Dockerfile`'s `build` stage does `COPY . /src` with
+# `WORKDIR /src/edge`, so an unexcluded `edge/target` lands exactly where
+# `COPY --from=cook /src/edge/target target` is about to put the cooked
+# dependencies, and 1.7 GB of stale host artifacts ride along in the layer.
+#
+# ** is any number of directories including none, so this also covers `target/`,
+# which is kept above for a reader who stops at the first matching line.
+**/target/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
@@ -167,3 +187,11 @@ ban_post_list.db
 core.*
 postgres/
 database.tar
+
+# Fase 4's shadow log. It is written by the edge at run time — including by a
+# `cargo run` on the host, which is how the local proof is run — and it sits
+# inside a directory both edge images `COPY` wholesale. Without this line, one
+# comparison run rewrites the file and invalidates every layer downstream of that
+# `COPY`, which on this tree is most of the build. The file is evidence, not
+# input; nothing in the image reads it.
+edge/shadow.jsonl

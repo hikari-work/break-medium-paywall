@@ -1,0 +1,36 @@
+{
+  "name": "page-no-collection",
+  "note": "`collection: null` — `generate_metadata` returns it as-is, `post.html` takes the `{% if collection %}` false branch, and `_render_as_html` leaves the ` | in {{ collection.name }}` clause off the page title (core.py:786-788). Null rather than a missing key, because missing is `Undefined` and `{{ collection.slug }}` inside the branch it does not take is what the truthiness check is there to avoid.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "A Standalone Post",
+        "creator": {
+          "id": "creator-1",
+          "name": "Ada Lovelace",
+          "username": "ada",
+          "bio": "Writes about engines.",
+          "imageId": "1*creator"
+        },
+        "collection": null,
+        "mediumUrl": "https://medium.com/@ada/a-standalone-post-0291df856c77",
+        "readingTime": 3,
+        "isLocked": false,
+        "firstPublishedAt": 1692000000000,
+        "updatedAt": 1692000000000,
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [{ "displayTitle": "Rust", "normalizedTagSlug": "rust" }],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Body one.", "name": "p1", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

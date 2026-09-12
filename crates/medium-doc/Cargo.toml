@@ -17,5 +17,9 @@ regex = { workspace = true }
 url = { workspace = true }
 form_urlencoded = { workspace = true }
 psl = { workspace = true }
+# `LinkResolver` is a network seam — see `resolve.rs` — and the only way to keep
+# it object-safe behind a `&dyn` is to box the future.
+async-trait = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true }

@@ -26,7 +26,7 @@
 //! the wrong span, a wrong class, a missed escape. Both sides go through this
 //! one function, so the parser's error recovery cannot favour either.
 //!
-//! Three deliberate normalisations, all symmetric:
+//! Four deliberate normalisations, all symmetric:
 //!
 //! - The annotations over a text node are compared as a **set**, not a sequence,
 //!   so which of two annotations ends up outermost does not matter. Only a
@@ -36,6 +36,12 @@
 //!   indentation is text in the DOM but not in the output.
 //! - Attribute order is sorted, because only the *set* of attributes carries
 //!   meaning here.
+//! - A `<meta charset>` value is compared case-insensitively. This one is not
+//!   symmetry but a gap that Fase 4's shadow traffic closed: the legacy handler
+//!   serialises every page through html5lib with an encoding, whose
+//!   `inject_meta_charset` filter rewrites that attribute to the lowercase
+//!   encoding string. See [`walk`] for the full reasoning and for what is
+//!   deliberately left strict.
 //!
 //! What it does **not** do is relax the text. Whitespace inside a text node is
 //! kept verbatim, so a code block whose newlines moved still fails.
@@ -148,7 +154,37 @@ fn walk(handle: &Handle, ancestors: &mut Vec<Annotation>, out: &mut Vec<Canonica
 
             let mut collected: BTreeMap<String, String> = BTreeMap::new();
             for attr in attrs.borrow().iter() {
-                collected.insert(attr.name.local.to_string(), attr.value.to_string());
+                let name = attr.name.local.to_string();
+                let mut value = attr.value.to_string();
+                // The one attribute value this comparison normalises, and the
+                // shadow run in Fase 4 is what found that it had to.
+                //
+                // `handlers/post.py:99-100` puts every served page through
+                // html5lib's `parse`/`serialize`, and passing an `encoding`
+                // turns on the serializer's `inject_meta_charset` filter, which
+                // **replaces** the charset attribute with the encoding string it
+                // was handed (`html5lib/filters/inject_meta_charset.py`). Python
+                // therefore serves `charset=utf-8` where the template — and the
+                // Rust port, which drops the round-trip entirely — say `UTF-8`.
+                //
+                // Per the Encoding Standard a charset label is case-insensitive,
+                // and no browser can tell those two apart, so this difference is
+                // exactly the kind the canonical form exists to forgive: it was
+                // forgiving the round-trip's doctype, optional tags and attribute
+                // quoting, and missing the one rewrite that touches a value.
+                //
+                // Only this attribute, and only on `<meta>`. Every other value —
+                // `class`, `id`, `href`, `src`, `alt`, any `data-*` — is compared
+                // verbatim, which is most of the point of holding the annotation
+                // chain at all. The `http-equiv="Content-Type"` spelling of the
+                // same declaration is deliberately **not** covered: html5lib
+                // rewrites its `content` too, and a difference there should be
+                // reported rather than normalised away through an attribute that
+                // means other things on other elements.
+                if tag == "meta" && name == "charset" {
+                    value.make_ascii_lowercase();
+                }
+                collected.insert(name, value);
             }
             let annotation = Annotation {
                 tag: tag.clone(),
@@ -235,6 +271,43 @@ mod tests {
         assert_eq!(
             describe(r#"<img alt="a" src="b">"#),
             describe(r#"<img src="b" alt="a">"#)
+        );
+    }
+
+    /// Fase 4's first finding, as a test. Python serves `utf-8` because
+    /// html5lib's `inject_meta_charset` filter replaced it; the Rust port serves
+    /// the template's `UTF-8`. Both are the same declaration.
+    #[test]
+    fn meta_charset_case_does_not_matter() {
+        assert_eq!(
+            describe(r#"<meta charset="UTF-8">"#),
+            describe(r#"<meta charset="utf-8">"#)
+        );
+    }
+
+    /// The normalisation is case-only, so a genuinely different encoding is
+    /// still a difference. Without this, "forgive the case" could be read as
+    /// "ignore the attribute".
+    #[test]
+    fn a_different_charset_is_still_a_difference() {
+        assert_ne!(
+            describe(r#"<meta charset="utf-8">"#),
+            describe(r#"<meta charset="iso-8859-1">"#)
+        );
+    }
+
+    /// And it is `<meta charset>` only. Attribute values are otherwise compared
+    /// verbatim — `class` most of all, since that is what an article's
+    /// presentation is made of.
+    #[test]
+    fn other_attribute_values_still_compare_exactly() {
+        assert_ne!(
+            describe(r#"<p class="font-bold">x</p>"#),
+            describe(r#"<p class="Font-Bold">x</p>"#)
+        );
+        assert_ne!(
+            describe(r#"<div charset="UTF-8">x</div>"#),
+            describe(r#"<div charset="utf-8">x</div>"#)
         );
     }
 
