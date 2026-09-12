@@ -1,0 +1,152 @@
+# Container images for the Rust stack, published to GHCR (Fase 5's deploy path).
+#
+# WHY THIS IS NOT PART OF `rust.yml`
+#
+# `rust.yml` is the code gate: it answers "is the source correct". This file is
+# the artefact gate: it answers "can the thing we ship be built and delivered".
+# They fail for different reasons and are read by different people, so a red
+# `check` job must not be confusable with a red image build. The cheap jobs in
+# `rust.yml` still run first on every push either way — this one only adds a
+# slower job on top.
+#
+# WHY CI AT ALL, AND NOT THE DEPLOY HOST
+#
+# The target VPS is 3 vCPU and already runs fifteen other containers. A cold
+# build of this workspace compiles BoringSSL through `btls-sys`, which on that
+# box is tens of minutes of stolen CPU. GitHub's runners are free and idle, so
+# the host's only job is `docker compose pull`.
+#
+# The naming follows the host's own convention rather than inventing one: the
+# five services already deployed there (`api-gate-api`, `api-gate-web`,
+# `cek-pelunasan`, `uploader-bot`, `userbot`) are all pulled as
+# `ghcr.io/hikari-work/<service>`, and their deploy dirs are all
+# `/root/<service>/docker-compose.yml`. Freedium is the sixth.
+
+name: images
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches: [main, 'rust/**']
+    # A documentation-only commit must not spend twenty minutes recompiling
+    # BoringSSL. The corpus of `.md` files here is large and changes often —
+    # `xtask/spike-impersonate/README.md` and `edge/README.md` both carry
+    # measurement write-ups — and none of it reaches the image except the few
+    # lines inside the Dockerfiles themselves.
+    paths-ignore:
+      - '**.md'
+
+# A newer push to the same ref makes the in-flight build obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Push to GHCR. `GITHUB_TOKEN` is enough for packages owned by this repo, so
+  # there is no registry secret to configure and none to rotate — which also
+  # means no long-lived credential exists to leak.
+  packages: write
+
+jobs:
+  build:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      # The two images are independent; a broken healthcare build must not hide
+      # whether the server image was fine, and vice versa.
+      fail-fast: false
+      matrix:
+        include:
+          # The only image the deployment actually runs. Context is the
+          # repository root — the Cargo workspace, its lockfile and the
+          # `caddy/static` copy this image serves all live above `crates/`, so
+          # the context cannot be narrowed to the crate directory.
+          - image: freedium-web
+            file: crates/freedium-web/Dockerfile
+            context: .
+
+          # Fase 5's WARP pool. This one is built from source rather than pulled
+          # because it is repo code, not an upstream image: it watches wgcf1's
+          # health and restarts it when the tunnel dies.
+          - image: freedium-wgcf-healthcare
+            file: wgcf/wgcf-healthcare/Dockerfile
+            context: wgcf/wgcf-healthcare
+
+        # NOT built here, deliberately:
+        #
+        #   * `Dockerfile` (Python) — the Rust rewrite replaced it before the
+        #     Python version was ever deployed, so nothing runs it. Building it
+        #     on every push would be pure cost.
+        #   * `caddy/Dockerfile` — the deploy host's nginx already owns :80/:443
+        #     for five vhosts, so no Caddy container runs there.
+        #   * `edge/Dockerfile` (Pingora) — Fase 7, and SPIKE-3 has not been run.
+        #
+        # Each is one matrix entry away from being built. They are left out
+        # visibly rather than silently so that "build every image" is a decision
+        # someone can reverse in a single line.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # BuildKit, which this Dockerfile requires independently of the cache:
+      # both stages use `RUN --mount=type=cache`, so a classic builder fails on
+      # the very first stage.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` is gated on the default branch. Note that this repository's
+      # default branch is `rust/fase-0`, not `main` — the rewrite lives there
+      # while `main` stays frozen at the Python baseline — so `latest` currently
+      # tracks the Rust branch, which is what the deploy host wants to pull.
+      #
+      # `sha-<short>` is the one that matters for anything real: it makes a
+      # rollback a matter of changing one tag in `.env` on the host, instead of
+      # rebuilding a revision that may no longer be checked out anywhere.
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha,format=short,prefix=sha-
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          # Explicit rather than implicit. The host is `cloud-amd64` and the
+          # runner is amd64, so a multi-arch build would double the slowest part
+          # of this job to produce an arm64 image nothing runs.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # `scope` per image, so the two builds do not evict each other from
+          # the shared cache. `mode=max` caches intermediate stages, which is
+          # the whole point here: without it `cargo chef cook` — the stage that
+          # compiles BoringSSL and every other dependency — re-runs from scratch
+          # on every push.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      # The digest, not just the tag. A tag can be moved; on the host this is
+      # the only record of which bytes are actually serving traffic.
+      - name: Summary
+        run: |
+          {
+            echo "### \`${{ matrix.image }}\`"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
