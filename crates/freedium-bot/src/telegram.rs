@@ -204,6 +204,35 @@ impl TelegramError {
         )
     }
 
+    /// Apakah Telegram menolak **isi** sebuah hasil inline.
+    ///
+    /// Pasangan **`400` + metode `answerGuestQuery`**, dengan alasan yang sama
+    /// seperti [`Self::is_rich_message_rejection`]: deskripsi penolakannya
+    /// berbeda-beda, jadi yang bisa diandalkan cuma kodenya, dan kode itu
+    /// sendirian terlalu luas.
+    ///
+    /// Inilah galat yang jatuh pada artikel bergambar di jalur tamu —
+    /// *"invalid inline message content specified"* — sementara artikel yang
+    /// sama persis berhasil terkirim di DM. Pemanggil memakainya untuk
+    /// mencoba ulang dengan foto yang lebih sedikit.
+    ///
+    /// Konsekuensinya jujur, dan di sini lebih ringan daripada di
+    /// `is_rich_message_rejection`: `400` pada metode ini juga muncul kalau
+    /// `guest_query_id`-nya sudah basi, dan untuk kasus itu pemanggil akan
+    /// mencoba sekali lagi dengan foto lebih sedikit — dua percobaan yang gagal
+    /// juga, bukan jawaban yang salah.
+    #[must_use]
+    pub fn is_inline_content_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                method: ANSWER_GUEST_QUERY,
+                code: 400,
+                ..
+            }
+        )
+    }
+
     /// Apakah metodenya tidak dikenal — Bot API yang ditunjuk terlalu tua.
     #[must_use]
     pub fn is_unknown_method(&self) -> bool {
@@ -793,6 +822,12 @@ mod tests {
         futures_lite_block_on(client(transport).get_me()).expect_err("bukan ok")
     }
 
+    fn guest_error(body: &str) -> TelegramError {
+        let transport = Recorder::answering(body);
+        futures_lite_block_on(client(transport).answer_guest_query("42", &serde_json::Value::Null))
+            .expect_err("badannya ok: false")
+    }
+
     /// Menunggu lalu mengulang adalah jawaban yang benar untuk pembatasan laju;
     /// mengulang tanpa menunggu justru memperpanjangnya.
     #[test]
@@ -871,6 +906,34 @@ mod tests {
 
             assert!(!error.is_rich_message_rejection(), "kode {code}");
         }
+    }
+
+    /// Artikel bergambar ditolak Telegram **hanya di jalur tamu**: isi yang sama
+    /// persis berhasil terkirim di DM. Kalimatnya diambil apa adanya dari
+    /// penolakan sungguhan atas `9d0b88a1763b`.
+    #[test]
+    fn a_guest_content_rejection_is_told_apart_from_a_rich_message_one() {
+        let error = guest_error(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: invalid inline message content specified"}"#,
+        );
+
+        assert!(error.is_inline_content_rejection());
+        assert!(
+            !error.is_rich_message_rejection(),
+            "metodenya bukan sendRichMessage: {error:?}"
+        );
+    }
+
+    /// Arah sebaliknya juga harus tegas: penolakan `sendRichMessage` bukan
+    /// penolakan isi inline. Kalau keduanya tertukar, jalur tamu akan mencoba
+    /// ulang karena galat yang bukan miliknya — dan membuang foto tanpa sebab.
+    #[test]
+    fn a_rich_message_rejection_is_not_a_guest_content_rejection() {
+        let error = rich_error(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: Invalid list item type specified"}"#,
+        );
+
+        assert!(!error.is_inline_content_rejection());
     }
 
     /// Bot API yang ditunjuk terlalu tua. Pesannya harus menyebut versinya,

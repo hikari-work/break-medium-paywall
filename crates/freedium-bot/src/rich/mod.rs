@@ -93,8 +93,45 @@ pub struct Rendered {
 /// Hasilnya **tidak pernah** berupa pesan tanpa blok; lihat [`empty_notice`].
 #[must_use]
 pub fn rich_message(post: &PostDto, base_url: &str) -> Rendered {
-    let mut blocks = header(&post.meta);
-    blocks.extend(post.blocks.iter().filter_map(block));
+    rich_message_with_photos(post, base_url, usize::MAX)
+}
+
+/// Seperti [`rich_message`], tapi berhenti memberi foto setelah `max_photos`.
+///
+/// # Kenapa batas foto ada sama sekali
+///
+/// Jalur biasa tidak membutuhkannya: `sendRichMessage` ke sebuah obrolan
+/// menerima berapa pun foto yang muat di anggaran. Hasil **inline** tidak.
+/// Artikel dengan satu foto lolos sebagai panggilan tamu; artikel dengan tujuh
+/// ditolak `400 Bad Request: invalid inline message content specified` —
+/// padahal isi yang sama persis terkirim utuh di DM, 47 blok dan tujuh foto.
+///
+/// Yang membedakan keduanya belum bisa dipastikan dari sini, dan itu sebabnya
+/// batasnya sebuah **parameter** alih-alih angka yang ditanam: pemanggil yang
+/// menurunkannya bertahap sampai Telegram menerima, lalu mencatat di mana
+/// berhentinya.
+///
+/// # Yang dikorbankan fotonya, bukan teksnya
+///
+/// Blok gambar yang lewat batas **dibuang**, dan sisa artikelnya tetap utuh.
+/// Membiarkan [`fit`] yang memotong akan membuang justru bagian terbesar
+/// artikelnya, karena pemotongan berhenti di blok pertama yang lewat — dan
+/// kehilangan seluruh sisa teks jauh lebih merugikan pembaca daripada
+/// kehilangan gambar.
+///
+/// Satu `ImageRow` ikut seluruhnya atau tidak sama sekali, dengan alasan yang
+/// sama: kolase separuh adalah gambar yang berubah arti, bukan gambar yang
+/// kurang satu.
+///
+/// `max_photos` menghitung **semua** foto, termasuk gambar pratinjau di atas
+/// judul. Jadi `1` menyisakan tepat gambar pratinjaunya, dan `0` membuang
+/// fotonya sama sekali.
+#[must_use]
+pub fn rich_message_with_photos(post: &PostDto, base_url: &str, max_photos: usize) -> Rendered {
+    let mut photos = max_photos;
+
+    let mut blocks = header(&post.meta, &mut photos);
+    blocks.extend(post.blocks.iter().filter_map(|dto| block(dto, &mut photos)));
     blocks.extend(trailer(&post.meta));
 
     let Budgeted { blocks, truncated } = fit(blocks, continue_link(&post.meta.post_id, base_url));
@@ -107,6 +144,21 @@ pub fn rich_message(post: &PostDto, base_url: &str) -> Rendered {
         }),
         truncated,
     }
+}
+
+/// Mengambil jatah foto sebanyak `count`; `false` berarti jatahnya tidak cukup.
+///
+/// Satu-satunya tempat jatah itu berkurang. Tanpa satu pintu seperti ini,
+/// setiap cabang yang bisa menghasilkan foto harus ingat menghitungnya sendiri
+/// — dan yang lupa tidak akan menghasilkan galat apa pun, cuma foto yang lolos
+/// batas.
+fn take_photos(photos: &mut usize, count: usize) -> bool {
+    if *photos < count {
+        return false;
+    }
+
+    *photos -= count;
+    true
 }
 
 /// Pesan satu paragraf, tanpa apa pun yang lain.
@@ -156,10 +208,17 @@ fn empty_notice(post_id: &str, base_url: &str) -> InputRichBlock {
 }
 
 /// Gambar pratinjau, judul, subjudul, dan byline — lihat tabel di catatan modul.
-fn header(meta: &MetaDto) -> Vec<InputRichBlock> {
+///
+/// Gambar pratinjaunya yang pertama mengambil jatah dari `photos`, dan itu
+/// disengaja: halaman menampilkannya di atas judul, jadi kalau cuma satu foto
+/// yang boleh dikirim, inilah yang paling menentukan hasilnya terlihat seperti
+/// artikel. Lihat [`rich_message_with_photos`].
+fn header(meta: &MetaDto, photos: &mut usize) -> Vec<InputRichBlock> {
     let mut blocks = Vec::new();
 
-    if let Some(url) = non_empty(meta.preview_image_url.as_deref()) {
+    if let Some(url) = non_empty(meta.preview_image_url.as_deref())
+        && take_photos(photos, 1)
+    {
         blocks.push(photo(url, None));
     }
 
@@ -320,7 +379,11 @@ fn continue_link(post_id: &str, base_url: &str) -> InputRichBlock {
 /// — kicker di kepala artikel adalah `H4`, sedangkan judul bagian `H3` — dan
 /// memetakan `level` ke ukuran lain akan membalik hierarki yang justru sedang
 /// direproduksi.
-fn block(block: &BlockDto) -> Option<InputRichBlock> {
+///
+/// Jatah `photos` dikurangi di sini, bukan di [`rich_message_with_photos`]:
+/// cuma cabang yang benar-benar menghasilkan gambar yang tahu berapa fotonya —
+/// satu untuk `Image`, sebanyak isinya untuk `ImageRow`.
+fn block(block: &BlockDto, photos: &mut usize) -> Option<InputRichBlock> {
     match block {
         BlockDto::Heading { level, content, .. } => Some(InputRichBlock::Heading {
             text: inline(content),
@@ -393,9 +456,19 @@ fn block(block: &BlockDto) -> Option<InputRichBlock> {
             })
         }
 
-        BlockDto::Image { url, alt, caption } => Some(photo(url, caption_of(caption, alt))),
+        BlockDto::Image { url, alt, caption } => {
+            take_photos(photos, 1).then(|| photo(url, caption_of(caption, alt)))
+        }
 
         BlockDto::ImageRow { images } => {
+            // Diperiksa lebih dulu, dan itu yang membuat barisnya utuh atau
+            // hilang sama sekali — lihat [`rich_message_with_photos`]. Baris
+            // kosong tetap tidak menghasilkan blok, karena jatah nol selalu
+            // cukup dan `blocks` di bawahnya lalu kosong.
+            if !take_photos(photos, images.len()) {
+                return None;
+            }
+
             let blocks: Vec<InputRichBlock> = images
                 .iter()
                 .map(|image| photo(&image.url, alt_caption(&image.alt)))
@@ -634,6 +707,14 @@ mod tests {
         BlockDto::Paragraph {
             content,
             drop_cap: false,
+        }
+    }
+
+    fn image_block(url: &str) -> BlockDto {
+        BlockDto::Image {
+            url: url.to_string(),
+            alt: String::new(),
+            caption: None,
         }
     }
 
@@ -1030,6 +1111,73 @@ mod tests {
             !survives(vec![BlockDto::ImageRow { images: vec![] }]),
             "kolase tanpa gambar bukan blok"
         );
+    }
+
+    /// Jatah foto membuang gambarnya, bukan memotong artikelnya.
+    ///
+    /// Itu bedanya dengan [`budget::fit`], dan alasan batas ini ada sama sekali:
+    /// `fit` berhenti di blok pertama yang lewat anggaran, jadi menurunkan batas
+    /// media lewatnya akan membuang seluruh sisa teks. Jalur tamu butuh
+    /// kebalikannya — teksnya utuh, fotonya yang boleh hilang.
+    #[test]
+    fn a_photo_limit_drops_the_photos_and_keeps_the_rest_of_the_article() {
+        let article = post(
+            "Judul",
+            vec![
+                image_block("https://x/1*a.png"),
+                paragraph(vec![text("sebelum")]),
+                image_block("https://x/1*b.png"),
+                paragraph(vec![text("sesudah")]),
+            ],
+        );
+
+        let capped = |max_photos| rich_message_with_photos(&article, BASE_URL, max_photos);
+        let photos = |rendered: &Rendered| budget::Cost::of_blocks(&rendered.message.blocks).media;
+        let paragraphs = |rendered: &Rendered| {
+            rendered
+                .message
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, InputRichBlock::Paragraph { .. }))
+                .count()
+        };
+
+        assert_eq!(photos(&capped(usize::MAX)), 2, "tanpa batas, semuanya ikut");
+        assert_eq!(photos(&capped(1)), 1);
+        assert_eq!(photos(&capped(0)), 0);
+
+        for max_photos in [usize::MAX, 1, 0] {
+            let rendered = capped(max_photos);
+
+            assert_eq!(
+                paragraphs(&rendered),
+                2,
+                "teksnya harus utuh pada jatah {max_photos}"
+            );
+            assert!(
+                !rendered.truncated,
+                "jatah foto bukan pemotongan, dan jangan dilaporkan sebagai pemotongan"
+            );
+        }
+    }
+
+    /// Batasnya juga harus berlaku pada jawaban server yang sungguhan.
+    ///
+    /// Test di atas memakai post karangan, dan post karangan membuktikan
+    /// penalarannya konsisten dengan dirinya sendiri — bukan bahwa kontrak yang
+    /// benar-benar dikirim `/api/v1` bisa dibatasi. Gambar di `REAL_POST` ada
+    /// sebelas, jadi batasnya benar-benar menggigit di sini.
+    #[test]
+    fn a_photo_limit_holds_on_a_real_api_answer() {
+        let article = real();
+        let photos = |max_photos| {
+            let rendered = rich_message_with_photos(&article, BASE_URL, max_photos);
+            budget::Cost::of_blocks(&rendered.message.blocks).media
+        };
+
+        assert!(photos(usize::MAX) > 1, "fixture-nya memang bergambar");
+        assert_eq!(photos(1), 1, "gambar pratinjau yang tersisa");
+        assert_eq!(photos(0), 0);
     }
 
     /// **Divergensi yang disengaja.** Telegram tidak punya blok kartu, jadi yang

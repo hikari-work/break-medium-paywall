@@ -91,6 +91,26 @@ const NO_ARTICLE: &str = "Tidak menemukan artikel Medium di tautan itu. \
 /// paragraf di dalam pesannya.
 const NOTICE_TITLE: &str = "Freedium";
 
+/// `id` hasil inline untuk pesan yang bukan artikel.
+///
+/// Telegram mewajibkan setiap hasil punya `id`, dan yang ini tidak menandai
+/// sebuah post — tidak ada post yang bisa ditunjuknya.
+const NOTICE_ID: &str = "tamu";
+
+/// Jatah foto yang dicoba berturut-turut untuk sebuah panggilan tamu.
+///
+/// Yang pertama tanpa batas: kalau Telegram menerimanya, tidak ada yang
+/// dikorbankan, dan itulah yang terjadi pada hampir semua artikel. Yang kedua
+/// menyisakan satu foto — gambar pratinjau di atas judul, yang membuat hasilnya
+/// masih terlihat seperti artikel. Yang terakhir membuang fotonya sama sekali,
+/// dan itu satu-satunya isi yang **diketahui** diterima: artikel satu foto
+/// (`a61157615501`) lolos, artikel tujuh foto (`9d0b88a1763b`) ditolak, dengan
+/// isi yang sama persis yang terkirim utuh di DM.
+///
+/// Urutannya menurun dan berhenti di yang pertama berhasil, jadi artikel yang
+/// tidak bermasalah tidak pernah membayar satu pun percobaan tambahan.
+const GUEST_PHOTO_LADDER: [usize; 3] = [usize::MAX, 1, 0];
+
 /// Balasan untuk `/start`, `/help`, dan pesan yang tidak memuat tautan.
 const HELP: &str = "\
 Kirim tautan artikel Medium ke sini, dan saya balas dengan isinya.
@@ -368,42 +388,86 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
             return;
         }
 
-        let (post_id, title, rendered) = match self.first_article(&candidates).await {
-            Ok((post_id, post)) => {
-                let title = post.meta.title.clone();
-                let rendered = self.render(&post_id, &post);
-                (post_id, title, rendered)
-            }
+        let (post_id, post) = match self.first_article(&candidates).await {
+            Ok(found) => found,
             Err(NotFound::NoCandidate) => {
-                self.answer_guest(
-                    query_id,
-                    "tamu",
-                    NOTICE_TITLE,
-                    rich::one_paragraph(NO_ARTICLE),
-                )
-                .await;
+                self.guest_notice(query_id, NO_ARTICLE).await;
                 return;
             }
             Err(NotFound::Api(error)) => {
                 tracing::warn!("gagal mengambil artikel: {error}");
-                self.answer_guest(
-                    query_id,
-                    "tamu",
-                    NOTICE_TITLE,
-                    rich::one_paragraph(&format!("Gagal mengambil artikelnya: {error}")),
-                )
-                .await;
+                self.guest_notice(query_id, &format!("Gagal mengambil artikelnya: {error}"))
+                    .await;
                 return;
             }
         };
 
-        self.answer_guest(query_id, &post_id, &title, rendered)
+        self.answer_guest_reduced(query_id, &post_id, &post).await
+    }
+
+    /// Menjawab panggilan tamu, menurunkan jatah fotonya sampai Telegram terima.
+    ///
+    /// # Kenapa harus bertahap, bukan sekali tebak
+    ///
+    /// Hasil inline menolak artikel bergambar dengan *"invalid inline message
+    /// content specified"*, sementara isi yang sama persis terkirim utuh di DM.
+    /// Yang mana yang sebenarnya jadi pembatas belum bisa dipastikan dari sini —
+    /// jumlah medianya, satu media tertentu, atau sesuatu yang belum terpikir.
+    ///
+    /// Karena itu bot ini yang mencarinya, bukan sebuah angka yang ditebak di
+    /// kode: ia menurunkan jatahnya sampai ada yang diterima, dan mencatat di
+    /// mana berhentinya. Satu hari pemakaian sungguhan menjawab pertanyaan yang
+    /// tidak bisa dijawab oleh pembacaan dokumen.
+    ///
+    /// Yang **tidak** diulang: penolakan karena sebab lain. Mengurangi foto
+    /// tidak akan memperbaiki `guest_query_id` yang basi atau token yang salah,
+    /// dan mengulanginya cuma menambah dua permintaan gagal ke log.
+    async fn answer_guest_reduced(&self, query_id: &str, post_id: &str, post: &PostDto) {
+        for (nomor, max_photos) in GUEST_PHOTO_LADDER.iter().enumerate() {
+            let rendered = self.render_with_photos(post_id, post, *max_photos);
+
+            match self
+                .answer_guest(query_id, post_id, &post.meta.title, rendered)
+                .await
+            {
+                Answered::Delivered | Answered::Failed => return,
+                Answered::ContentRejected => {
+                    if nomor + 1 < GUEST_PHOTO_LADDER.len() {
+                        tracing::warn!(
+                            post_id,
+                            max_photos,
+                            "isi inline ditolak; mencoba lagi dengan lebih sedikit foto"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Menjawab panggilan tamu dengan satu paragraf pemberitahuan.
+    ///
+    /// Hasilnya dibuang dengan sengaja: pemberitahuan tidak punya foto yang
+    /// bisa dikurangi, jadi tidak ada percobaan kedua yang masuk akal, dan
+    /// [`Bot::answer_guest`] sudah mencatat kegagalannya sendiri.
+    async fn guest_notice(&self, query_id: &str, text: &str) {
+        let _ = self
+            .answer_guest(query_id, NOTICE_ID, NOTICE_TITLE, rich::one_paragraph(text))
             .await;
     }
 
     /// Artikel jadi pesan, dengan pencatatan pemotongan yang sama di kedua jalur.
     fn render(&self, post_id: &str, post: &PostDto) -> rich::Rendered {
-        let rendered = rich::rich_message(post, self.api.base_url());
+        self.render_with_photos(post_id, post, usize::MAX)
+    }
+
+    /// [`Bot::render`] dengan jatah foto — lihat [`GUEST_PHOTO_LADDER`].
+    fn render_with_photos(
+        &self,
+        post_id: &str,
+        post: &PostDto,
+        max_photos: usize,
+    ) -> rich::Rendered {
+        let rendered = rich::rich_message_with_photos(post, self.api.base_url(), max_photos);
 
         if rendered.truncated {
             tracing::info!(post_id, "artikel dipotong supaya muat");
@@ -418,13 +482,16 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
     /// yang sama dengan [`Bot::deliver`], dan sengaja tidak disatukan dengan
     /// helper generik: satu-satunya yang dibagi keduanya adalah bentuk loop-nya,
     /// sedangkan yang dikirim dan cara mencatatnya berbeda.
+    ///
+    /// Yang dikembalikan membedakan **kenapa** gagal, karena pemanggilnya
+    /// memperlakukan ketiganya berbeda — lihat [`Answered`].
     async fn answer_guest(
         &self,
         query_id: &str,
         post_id: &str,
         title: &str,
         rendered: rich::Rendered,
-    ) {
+    ) -> Answered {
         let result = telegram::guest_query_result(post_id, title, &rendered.message);
         let mut attempt = 0;
 
@@ -434,10 +501,11 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
                     tracing::info!(
                         post_id,
                         blocks = rendered.message.blocks.len(),
+                        photos = rich::budget::Cost::of_blocks(&rendered.message.blocks).media,
                         truncated = rendered.truncated,
                         "artikel terjawab sebagai panggilan tamu"
                     );
-                    return;
+                    return Answered::Delivered;
                 }
                 Err(error) => {
                     if let Some(wait) = error.retry_after()
@@ -456,7 +524,12 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
                     if let Some(advice) = error.advice() {
                         tracing::error!("{advice}");
                     }
-                    return;
+
+                    return if error.is_inline_content_rejection() {
+                        Answered::ContentRejected
+                    } else {
+                        Answered::Failed
+                    };
                 }
             }
         }
@@ -582,4 +655,21 @@ enum NotFound {
     NoCandidate,
     /// Ada yang benar-benar rusak.
     Api(ApiError),
+}
+
+/// Apa yang terjadi pada satu percobaan menjawab panggilan tamu.
+///
+/// Tiga keadaan, bukan `bool`, karena pemanggilnya memperlakukan ketiganya
+/// berbeda: yang pertama berhenti, yang kedua menurunkan jatah foto, yang
+/// ketiga berhenti juga — dan menggabungkan dua yang terakhir jadi "gagal"
+/// berarti membuang foto tanpa alasan pada setiap galat jaringan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answered {
+    /// Telegram menerimanya.
+    Delivered,
+    /// Telegram menolak isinya. Jatah foto yang lebih kecil masih masuk akal
+    /// dicoba — lihat [`GUEST_PHOTO_LADDER`].
+    ContentRejected,
+    /// Galat lain. Mengubah isi tidak akan menolongnya.
+    Failed,
 }
