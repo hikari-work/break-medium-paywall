@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 medium-doc = { path = "../medium-doc" }
+freedium-dto = { path = "../freedium-dto" }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

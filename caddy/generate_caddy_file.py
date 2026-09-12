@@ -18,7 +18,18 @@ ACCESS_DENIED_PATHS: List[str] = [
     "onboarding/*",
     "wp-*",
     ".env",
-    "api*",
+    # `"api*"` used to be here, and its removal is Fase 6. It answered
+    # `403 Access denied` to `/api*` — every path, not only `/api/` — which is
+    # the whole of the legacy's "this deployment has no public API". The Rust
+    # server serves one at `/api/v1` (§2.7), so the denylist entry has to go with
+    # it. Regenerating `caddy/Caddyfile` after this edit removes exactly one
+    # `handle_path /api*` block and adds nothing.
+    #
+    # **This is prepared and not deployed.** Until a reload happens, a deployed
+    # edge still answers `403` for `/api/*`; the API's own proof runs against the
+    # Rust server directly. Deploy order is Caddy first, then telling clients the
+    # API exists — the reverse leaves every caller with a `403` from an edge that
+    # is answering correctly for the config it has.
     "apple-touch-icon-precomposed.png",
     "rss.xml",
     ".git/*",
@@ -75,12 +86,32 @@ def render_caddy_file(template_path: str, output_path: str, rules: str) -> None:
         with open(template_path, "r") as file:
             template = Template(file.read())
 
-        rendered_content = template.render(template=rules)
+        rendered_content = normalize(template.render(template=rules))
 
         with open(output_path, "w") as file:
             file.write(rendered_content)
     except IOError as e:
         print(f"Error processing {template_path}: {e}")
+
+
+def normalize(content: str) -> str:
+    """Trailing whitespace off every line, exactly one newline at the end.
+
+    Not cosmetic, and not a preference: without it this script does **not**
+    reproduce the file it just wrote. The rule templates above end with the
+    indentation of their closing `\"\"\"`, so every rule contributes a line of
+    four spaces after itself — 36 of them in the current `Caddyfile` — and the
+    last rule ends the file with no newline at all. Both are invisible in Caddy
+    and both made every regeneration a 38-line diff of whitespace wrapped around
+    whatever actually changed.
+
+    The committed `Caddyfile` was normalised by hand at some point, which is why
+    the two disagreed. Doing it here instead makes `python3
+    generate_caddy_file.py` idempotent: regenerate and the diff is the real
+    change and nothing else. That is the property Fase 6's one-block diff needs,
+    and it is the property any future edit needs too.
+    """
+    return "\n".join(line.rstrip() for line in content.splitlines()) + "\n"
 
 
 def main() -> None:

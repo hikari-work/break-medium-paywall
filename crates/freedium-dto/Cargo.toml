@@ -1,0 +1,39 @@
+[package]
+name = "freedium-dto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The public JSON contract for /api/v1. Fase 6 of the Rust rewrite."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# `utoipa` is behind a feature, and the feature is **off by default**. See the
+# crate docs for why this is a build-time gate separate from the runtime
+# `DISABLE_EXTERNAL_DOCS`.
+#
+# `macros` is the feature that brings `utoipa-gen`, and therefore the `ToSchema`
+# derive. The name is not `derive` — that is not a feature utoipa 5 has — and the
+# default feature set is `macros` plus more we do not use, so it is off.
+utoipa = { version = "5", default-features = false, features = ["macros"], optional = true }
+
+[dev-dependencies]
+# **Deliberately absent from `[dependencies]`, and that is load-bearing.**
+#
+# With no `serde_json` there, no function in this crate can accept or return a
+# `serde_json::Value`, so Medium's raw payload shape cannot leak into the public
+# contract by accident: the compiler refuses it rather than a reviewer noticing.
+# The mapping that *does* read the raw payload lives in `medium-render::dto`,
+# one crate away, where `serde_json` is a real dependency.
+#
+# Tests still need it — a JSON contract is only tested by serialising it.
+serde_json = { workspace = true }
+
+[features]
+default = []
+# Generates the `ToSchema` impls. `freedium-web` turns it on; `xtask/difftest`
+# and the shadow binary never do, so they pay no proc-macro cost.
+openapi = ["dep:utoipa"]

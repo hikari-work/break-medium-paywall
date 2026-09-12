@@ -57,6 +57,10 @@ pub struct RenderedPost {
     /// want — not because anything consumes it today.
     pub url: String,
 
-    /// The rendered body fragment.
+    /// The **whole page**, not a fragment: `base.html` with `post.html` spliced
+    /// into it, which is what `handlers/post.py:88-98` caches and serves.
+    ///
+    /// The article on its own is [`crate::page::render_post_body`]. Serving that
+    /// out of this field would ship the page chrome with it.
     pub html: String,
 }

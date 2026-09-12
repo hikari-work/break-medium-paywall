@@ -15,7 +15,7 @@
 //! | [`retry`] | The retry loop, with the legacy `reason` bug deliberately not reproduced |
 //! | [`proxy`] | The in-process WARP pool that replaces HAProxy |
 //! | [`http`] | [`http::HttpPostSource`] — the whole path, over a pluggable [`http::Transport`] |
-//! | [`source`] | The trait, and nothing else |
+//! | [`http`] | [`http::AnonymousSource`] — the same, with no path to a credential |//! | [`source`] | The trait, and nothing else |
 //! | [`resolver`] | [`resolver::HttpLinkResolver`] — `link.medium.com` → post id |
 //! | [`media`] | [`media::MediaFetcher`] — the `@miro/` and `render_iframe/` passthroughs |
 //!
@@ -27,6 +27,10 @@
 //!
 //! Everything else that needs posts takes a `dyn PostSource`, so a test — or
 //! Fase 3's server, before SPIKE-1 resolves — can supply fixed JSON instead.
+//!
+//! [`http::AnonymousSource`] is the same fetch with the credential removed at the
+//! type level, and it exists because `MEDIUM_AUTH_COOKIES` is set in production:
+//! read its docs before touching anything that serves `/api/v1`.
 //!
 //! # Three callers, one transport
 //!

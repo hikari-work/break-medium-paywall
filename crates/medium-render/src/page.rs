@@ -103,12 +103,19 @@ pub fn render_base(
     }))
 }
 
-/// `render_medium_post_link`'s second half (`handlers/post.py:88-98`).
+/// The article fragment: exactly what `base.html` splices in as `body_template`.
 ///
-/// Renders `post.html` around the article body and wraps it in `base.html`. The
-/// returned [`RenderedPost`] is the cacheable unit: `title` holds the page title
-/// rather than the article's, matching `HtmlResult`'s field order
-/// (`models/html_result.py:4-9`).
+/// # Why this is separate from [`render_post`]
+///
+/// `RenderedPost.html` is the **whole page**, so nothing that wants only the
+/// article can reuse it — which is what `/api/v1/posts/{id}/html` needs. This is
+/// the single place `post.html` is rendered, and [`render_post`] calls it, so the
+/// page and the fragment cannot drift; `render_post_body_is_a_substring_of_render_post`
+/// pins that rather than assuming it.
+///
+/// No [`PageConfig`]: `post.html` interpolates neither `host_address` nor
+/// `enable_ads_header` — see the module docs. Passing the config here would be an
+/// unused parameter pretending to be a dependency.
 ///
 /// # `content` is a list of fragments, not one string
 ///
@@ -116,18 +123,30 @@ pub fn render_base(
 /// The loop is why [`render_blocks`] returns a `Vec<String>` — the legacy
 /// `out_paragraphs` is a list too, and keeping the shape means a divergence can
 /// be reported as "block 7" instead of "the page".
+pub fn render_post_body(
+    env: &Environment<'_>,
+    document: &Document,
+    metadata: &PostMetadata,
+) -> Result<String, Error> {
+    let content = render_blocks(document);
+    env.get_template("post.html")?
+        .render(post_context(metadata, &content))
+}
+
+/// `render_medium_post_link`'s second half (`handlers/post.py:88-98`).
+///
+/// Renders `post.html` around the article body and wraps it in `base.html`. The
+/// returned [`RenderedPost`] is the cacheable unit: `title` holds the page title
+/// rather than the article's, matching `HtmlResult`'s field order
+/// (`models/html_result.py:4-9`).
 pub fn render_post(
     env: &Environment<'_>,
     document: &Document,
     metadata: &PostMetadata,
     config: &PageConfig,
 ) -> Result<RenderedPost, Error> {
-    let content = render_blocks(document);
-
     let page_title = metadata.page_title();
-    let body = env
-        .get_template("post.html")?
-        .render(post_context(metadata, &content))?;
+    let body = render_post_body(env, document, metadata)?;
     let html = render_base(env, &body, &page_title, &metadata.description, config)?;
 
     Ok(RenderedPost {
@@ -517,6 +536,88 @@ mod tests {
             ))
             .unwrap();
         assert!(page.contains("Free: No"));
+    }
+
+    /// **The invariant behind the extraction, and the reason it is safe to
+    /// maintain.**
+    ///
+    /// `/api/v1/posts/{id}/html` serves [`render_post_body`] and the page serves
+    /// [`render_post`], which wraps it. If the wrap ever stopped being a splice —
+    /// a re-render, a transform, an escaping step — the two would quietly serve
+    /// different articles and no byte-level page gate would notice.
+    ///
+    /// It is an assertion rather than a guarantee because minijinja runs with
+    /// autoescape **off** (`crate::templates`), so the body reaches `base.html`
+    /// verbatim through `{{ body_template }}`. That is also what
+    /// `autoescape_is_off_in_every_template` pins; this test depends on it.
+    #[test]
+    fn render_post_body_is_a_substring_of_render_post() {
+        let env = environment();
+        let m = metadata();
+        let config = PageConfig::default();
+
+        // A document with real blocks: an empty one would make the assertion pass
+        // for a body that rendered to nothing at all.
+        let document = Document {
+            meta: PostMeta::default(),
+            blocks: vec![
+                paragraph("First paragraph."),
+                paragraph("Second paragraph."),
+            ],
+        };
+
+        let body = render_post_body(&env, &document, &m).unwrap();
+        let page = render_post(&env, &document, &m, &config).unwrap();
+
+        assert!(
+            body.contains("First paragraph.") && body.contains("Second paragraph."),
+            "the fragment must carry the article: {body}"
+        );
+        assert!(
+            page.html.contains(&body),
+            "render_post must splice render_post_body's output verbatim, not re-render it"
+        );
+
+        // The fragment is a fragment. `base.html`'s chrome must not be in it, or
+        // `/html` is serving a nested page.
+        assert!(
+            !body.contains("<html"),
+            "the fragment carries the page shell"
+        );
+        assert!(
+            !body.contains("<head"),
+            "the fragment carries the page head"
+        );
+        assert!(page.html.contains("<html"), "the page must still be a page");
+    }
+
+    /// The article body is not empty-by-construction, so
+    /// `render_post_body_is_a_substring_of_render_post` cannot pass on a document
+    /// that renders to nothing.
+    #[test]
+    fn a_paragraph_block_renders_into_the_fragment() {
+        let env = environment();
+        let document = Document {
+            meta: PostMeta::default(),
+            blocks: vec![paragraph("hello")],
+        };
+
+        let body = render_post_body(&env, &document, &metadata()).unwrap();
+        assert!(
+            body.contains("hello"),
+            "the block did not reach the template"
+        );
+    }
+
+    /// One plain paragraph, with the IR's non-default choices spelled out so a
+    /// future field cannot change what these tests render without a compile error.
+    fn paragraph(text: &str) -> medium_doc::ir::Block {
+        use medium_doc::ir::{Block, Inline, ParagraphMargin};
+        Block::Paragraph {
+            inline: vec![Inline::Text(text.to_string())],
+            drop_cap: false,
+            margin: ParagraphMargin::Mt7,
+        }
     }
 
     /// `render_post` hands back the three values `HtmlResult` carries, in the

@@ -95,6 +95,31 @@ markup5ever_rcdom = "0.39"
 minijinja = "2"
 minijinja-embed = "2"
 
+# --- Fase 6: the public API --------------------------------------------------
+#
+# `governor` directly, **not `tower_governor`**. Three of the four buckets are not
+# shaped like a layer: the miss bucket is charged from *inside* a handler, after
+# the cache lookup has already been made, and the fetch budget is process-global
+# rather than keyed. The fourth wants `X-RateLimit-*` headers and an RFC 9457
+# body, neither of which `tower_governor` produces — so the layer would be ~15
+# lines of glue plus 100% of a dependency. See `freedium-web::api::limit`.
+#
+# `dashmap` is governor's default store and is what makes the keyed map safe to
+# share; `retain_recent` on a `tokio` interval is what keeps it bounded, because
+# a key an attacker chooses must not be able to grow it forever.
+governor = "0.10"
+
+# `macros` brings `utoipa-gen`: the `ToSchema`/`OpenApi` derives. `axum_extras`
+# is what lets an axum extractor type appear in a `#[utoipa::path]` signature.
+# `preserve_order` is off, so the spec's key order is the derive's rather than
+# insertion order — deterministic either way, and the smaller feature set.
+utoipa = { version = "5", default-features = false, features = [
+    "macros",
+    "axum_extras",
+] }
+# The Scalar UI at `/api/v1/docs`, which is the /docs half of §2.7.
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

@@ -151,11 +151,6 @@
     }
 
 
-    handle_path /api* {
-        respond "Access denied" 403
-    }
-
-
     handle_path /apple-touch-icon-precomposed.png {
         respond "Access denied" 403
     }

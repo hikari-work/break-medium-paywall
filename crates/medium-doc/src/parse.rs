@@ -253,6 +253,16 @@ impl std::fmt::Display for Alt {
 pub struct Tag {
     #[serde(default, deserialize_with = "nullable_string")]
     pub display_title: String,
+    /// `normalizedTagSlug`, which `TagNoViewerEdgeData` selects and the public
+    /// DTO exposes. Nothing in the HTML pipeline reads it — `metadata::from_payload`
+    /// hands the raw tag objects to the template, which interpolates
+    /// `tag.normalizedTagSlug` itself — so this exists for `/api/v1` alone.
+    ///
+    /// It is `Option` rather than `String` because `nullable_string` would
+    /// collapse a missing slug and an empty one, and the DTO has to tell those
+    /// apart: `None` means Medium did not send one.
+    #[serde(default)]
+    pub normalized_tag_slug: Option<String>,
 }
 
 /// `post["highlights"][n]` — a reader's quote (`QuoteData` in the query).

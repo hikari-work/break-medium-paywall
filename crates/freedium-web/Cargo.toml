@@ -16,8 +16,12 @@ async-trait.workspace = true
 axum = "0.8.9"
 form_urlencoded.workspace = true
 freedium-cache = { version = "0.1.0", path = "../freedium-cache" }
+# `openapi` is turned on **here and nowhere else**: this is the one binary that
+# serves the spec, and the feature is what generates the `ToSchema` impls.
+freedium-dto = { version = "0.1.0", path = "../freedium-dto", features = ["openapi"] }
 futures-util = "0.3.34"
 getrandom.workspace = true
+governor.workspace = true
 medium-client = { version = "0.1.0", path = "../medium-client" }
 medium-doc = { version = "0.1.0", path = "../medium-doc" }
 medium-render = { version = "0.1.0", path = "../medium-render" }
@@ -29,6 +33,10 @@ minijinja.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+# Already a dependency of the workspace through `medium-doc`, and the hash the
+# API's ETag is built from — see `api::http_cache` for why it is a hash of the
+# response bytes rather than of anything structured.
+sha2.workspace = true
 subtle = "2.6.1"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
@@ -37,3 +45,5 @@ tower-http = { version = "0.7.1", features = ["fs", "compression-gzip", "compres
 tracing.workspace = true
 # `env-filter` is not a default feature, and `RUST_LOG` support needs it.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+utoipa.workspace = true
+utoipa-scalar.workspace = true

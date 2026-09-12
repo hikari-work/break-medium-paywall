@@ -21,15 +21,17 @@ use std::sync::Arc;
 
 use freedium_cache::postgres::PostgresCache;
 use freedium_cache::redis::RedisStore;
-use medium_client::http::{HttpPostSource, ReqwestTransport};
+use medium_client::http::{AnonymousSource, HttpPostSource, ReqwestTransport};
 use medium_client::media::MediaFetcher;
 use medium_client::proxy::{HealthProbe, ProxyEndpoint, ProxyPool, WarpTraceProbe};
+use medium_client::request;
 use medium_client::resolver::HttpLinkResolver;
 use medium_client::source::PostSource;
 use medium_doc::resolve::LinkResolver;
 use medium_render::templates;
 use minijinja::Environment;
 
+use crate::api::limit::Limits;
 use crate::config::Config;
 use crate::notify::Telegram;
 
@@ -45,6 +47,10 @@ pub struct AppState {
     pub redis: RedisStore,
     /// The outbound fetch, behind the seam. See the module docs.
     pub source: Arc<dyn PostSource>,
+    /// The same fetch, anonymously. See the field docs on [`AppState::new`].
+    pub api_source: AnonymousSource,
+    /// The API's four rate-limit buckets, built once.
+    pub limits: Arc<Limits>,
     /// `link.medium.com` → post id.
     pub resolver: Arc<dyn LinkResolver>,
     /// `@miro/` and `render_iframe/`.
@@ -101,9 +107,33 @@ impl AppState {
             health_probe(),
         ));
 
+        // `MEDIUM_GRAPHQL_ENDPOINT` overrides the upstream for both this and the
+        // API's source — it exists so the failure paths can be exercised against
+        // a local server, and `request::ENDPOINT` is the production value. It has
+        // to be applied to *both*: a walkthrough with `SHADOW_MODE=false` that
+        // left this source pointing at `medium.com` would send real requests to
+        // Medium while claiming to be offline, which is how the two lines below
+        // read before this was fixed.
+        let endpoint = config
+            .medium_graphql_endpoint
+            .clone()
+            .unwrap_or_else(|| request::ENDPOINT.to_string());
         let source = HttpPostSource::new(transport.clone(), Arc::clone(&pool))
             .with_timeout(config.request_timeout)
+            .with_endpoint(endpoint.clone())
             .with_auth_cookies(config.medium_auth_cookies.clone());
+
+        // The API's source, built from the same transport and the same pool and
+        // **never** from `source`: `AnonymousSource` has no way to reach
+        // `with_auth_cookies`, which is what makes "the API spends the account's
+        // unlock quota" impossible rather than merely absent. See
+        // `medium_client::http`'s docs on the type, and §2.7's warning 2.
+        let api_source = AnonymousSource::new(
+            transport.clone(),
+            Arc::clone(&pool),
+            config.request_timeout,
+            endpoint,
+        );
 
         let resolver = HttpLinkResolver::new(transport.clone());
 
@@ -112,11 +142,19 @@ impl AppState {
 
         let notifier = Telegram::new(transport, &config);
 
+        let limits = Arc::new(Limits::new(&config));
+        // The keyed maps have no eviction of their own and their keys are chosen
+        // by the caller, so the sweep is part of the design rather than an
+        // optimisation. See `api::limit`'s module docs.
+        crate::api::limit::spawn_housekeeping(Arc::clone(&limits));
+
         Ok(Self {
             config,
             postgres,
             redis,
             source: Arc::new(source),
+            api_source,
+            limits,
             resolver: Arc::new(resolver),
             media: Arc::new(media),
             notifier: Arc::new(notifier),
@@ -258,12 +296,43 @@ pub(crate) mod tests {
             proxy_list: Vec::new(),
             port: 7080,
             static_dir: "caddy/static".to_string(),
+            // The shipped defaults, not tighter ones: a test that reads a limit
+            // should be reading what a deployment gets. A test that needs a
+            // different number builds its own config rather than changing this,
+            // so the fixture cannot drift away from `Config::from_env`.
+            api_rate_limit_per_minute: crate::config::DEFAULT_API_RATE_LIMIT_PER_MINUTE,
+            api_rate_limit_burst: crate::config::DEFAULT_API_RATE_LIMIT_BURST,
+            api_miss_limit_per_minute: crate::config::DEFAULT_API_MISS_LIMIT_PER_MINUTE,
+            api_miss_limit_burst: crate::config::DEFAULT_API_MISS_LIMIT_BURST,
+            api_fetch_budget_per_minute: crate::config::DEFAULT_API_FETCH_BUDGET_PER_MINUTE,
+            api_fetch_budget_burst: crate::config::DEFAULT_API_FETCH_BUDGET_BURST,
+            api_token_limit_per_minute: crate::config::DEFAULT_API_TOKEN_LIMIT_PER_MINUTE,
+            api_token_limit_burst: crate::config::DEFAULT_API_TOKEN_LIMIT_BURST,
+            // The token tier is **off** here, which is the default deployment:
+            // `api_token: None` means the header is ignored, so an API test that
+            // never mentions the header is testing the untokened path.
+            api_token: None,
+            api_cache_seconds: crate::config::DEFAULT_API_CACHE_SECONDS,
+            // Off, because the stub has no proxy in front of it and a test that
+            // wants proxied addresses sets its own.
+            api_trust_proxy: false,
+            cors_allow_origins: Vec::new(),
+            medium_graphql_endpoint: None,
         }
     }
 
     /// Builds an [`AppState`] with no infrastructure. See the module docs.
     pub(crate) fn stub_state(source: Arc<dyn PostSource>) -> AppState {
-        let config = Arc::new(test_config());
+        stub_state_with(&test_config(), source)
+    }
+
+    /// [`stub_state`] with a config the caller chose.
+    ///
+    /// A `&Config` rather than a mutation of [`test_config`]'s result, because
+    /// `Config` is behind the `Arc` every stub state holds: a helper that edited
+    /// it in place would make one test's change visible to another.
+    pub(crate) fn stub_state_with(config: &Config, source: Arc<dyn PostSource>) -> AppState {
+        let config = Arc::new(config.clone());
         let transport = ReqwestTransport::new().expect("a reqwest client can be built");
         let pool = Arc::new(ProxyPool::new(Vec::new(), health_probe()));
 
@@ -276,6 +345,19 @@ pub(crate) mod tests {
             redis: RedisStore::connect_lazy(&config.redis_url(), config.redis_timeout())
                 .expect("a lazy client always builds"),
             source,
+            // A real `AnonymousSource`, deliberately: the point of the API tests
+            // is that the *page's* source is the stubbed one and this one is
+            // untouched. `127.0.0.1:1` is the unreachable endpoint
+            // `medium-client`'s own tests use — a closed port refuses
+            // immediately, so a handler test that accidentally fetches fails
+            // fast rather than hanging on a timeout.
+            api_source: AnonymousSource::new(
+                transport.clone(),
+                Arc::clone(&pool),
+                config.request_timeout,
+                "http://127.0.0.1:1",
+            ),
+            limits: Arc::new(Limits::new(&config)),
             resolver: Arc::new(OfflineLinkResolver),
             media: Arc::new(MediaFetcher::new(transport.clone(), Arc::clone(&pool))),
             notifier: Arc::new(Telegram::new(transport, &config)),
@@ -286,7 +368,13 @@ pub(crate) mod tests {
 
     /// The default stub: a source that fails every fetch.
     pub(crate) fn offline_state() -> AppState {
-        stub_state(Arc::new(RecordingSource(Mutex::new(Vec::new()))))
+        offline_state_with(&test_config())
+    }
+
+    /// [`offline_state`] with a config the caller chose — for a test that needs
+    /// the routing of a real [`AppState`] and a different flag, limit or host.
+    pub(crate) fn offline_state_with(config: &Config) -> AppState {
+        stub_state_with(config, Arc::new(RecordingSource(Mutex::new(Vec::new()))))
     }
 
     /// A [`stub_state`] whose instance believes it is a Fase 4 shadow.
@@ -305,5 +393,148 @@ pub(crate) mod tests {
         config.shadow_mode = true;
         state.config = Arc::new(config);
         state
+    }
+
+    /// One `GET` through the whole application, exactly as a client makes it.
+    ///
+    /// The full [`crate::router::router`] rather than `crate::api::router`, so
+    /// the request passes through the nest and the layers a deployment has. A
+    /// test that reached a handler directly could not tell `/api/v1` from the
+    /// page catch-all, which is half of what these tests are about.
+    async fn get(state: AppState, path: &str) -> axum::response::Response {
+        use tower::ServiceExt as _;
+
+        crate::router::router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .expect("a well-formed request"),
+            )
+            .await
+            .expect("the router answers")
+    }
+
+    /// The two sources are different objects, and that is the structural half of
+    /// the `MEDIUM_AUTH_COOKIES` invariant (§2.7 warning 2, decision 3).
+    ///
+    /// `Arc::as_ptr` and not a behaviour: this asserts the *wiring*, so it holds
+    /// even for a deployment whose config has no cookies at all. If the two ever
+    /// became the same `Arc`, the API would be one `.with_auth_cookies` call away
+    /// from spending the account's unlock quota, and no other test here would
+    /// notice.
+    #[tokio::test]
+    async fn the_api_and_the_page_use_different_sources() {
+        let state = offline_state();
+
+        let page: *const dyn PostSource = Arc::as_ptr(&state.source);
+        let api: *const dyn PostSource = Arc::as_ptr(state.api_source.inner());
+
+        assert!(
+            !std::ptr::eq(page, api),
+            "the API and the page share one source, so nothing stops the API from \
+             reaching the page's cookies"
+        );
+    }
+
+    /// An API cache miss reaches the **anonymous** source and not the page's.
+    ///
+    /// The recorder is the page's source, so an empty recording is the API
+    /// having gone elsewhere. The status is what makes that non-vacuous: a `502`
+    /// is only producible by the fetch path, so the handler really did reach a
+    /// source (the stub's `127.0.0.1:1` refuses immediately, which is a transport
+    /// error, which is an upstream error). Without the status assertion the
+    /// recording could be empty because the request stopped at the rate limiter.
+    ///
+    /// The converse is [`a_page_cache_miss_does_touch_the_page_source`], and the
+    /// pair is the point: either one alone passes for the wrong reason.
+    #[tokio::test]
+    async fn an_api_cache_miss_does_not_touch_the_page_source() {
+        let recorder = Arc::new(RecordingSource(Mutex::new(Vec::new())));
+        let state = stub_state(recorder.clone());
+
+        let response = get(state, "/api/v1/posts/0291df856c77").await;
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_GATEWAY,
+            "the request never reached a source, so the recording below is vacuous"
+        );
+        assert!(
+            recorder.0.lock().unwrap().is_empty(),
+            "the API fetched through the page's source: {:?}",
+            recorder.0.lock().unwrap()
+        );
+    }
+
+    /// The same request as a *page*, which does reach the page's source.
+    ///
+    /// Same state, same stubbed source, same miss — only the path differs. That
+    /// is what makes it the converse rather than a second test of the same
+    /// thing: if the recorder were simply never wired up, this one fails.
+    #[tokio::test]
+    async fn a_page_cache_miss_does_touch_the_page_source() {
+        let recorder = Arc::new(RecordingSource(Mutex::new(Vec::new())));
+        let state = stub_state(recorder.clone());
+
+        let response = get(state, "/0291df856c77").await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            recorder.0.lock().unwrap().as_slice(),
+            ["0291df856c77"],
+            "the page's source is the one a page request fetches through"
+        );
+    }
+
+    /// The API serves in the configuration production runs, which is the one the
+    /// invariant is about.
+    ///
+    /// `MEDIUM_AUTH_COOKIES` set means the page's source carries an account's
+    /// credentials. The assertion is a **comparison**: the same request, through
+    /// two states that differ in nothing but that config field, produces the same
+    /// status, the same problem `type` and the same `detail`. A status alone
+    /// would not catch an API that routed on the config, and the pair is what
+    /// makes the equality mean something.
+    ///
+    /// `detail` is comparable and the body is not: every problem carries a fresh
+    /// `request_id`.
+    ///
+    /// The other half lives in `medium-client`: `AnonymousSource` has no
+    /// `with_auth_cookies`, and its own test asserts no `cookie` header is sent.
+    /// This test cannot see that — it asserts the two things a config field can
+    /// affect from here. The **third** thing it could affect, `/api/v1/health`'s
+    /// `auth_cookies_configured`, is not asserted here: the stub's Postgres probe
+    /// fails, so the handler answers a `503` problem and never builds the DTO.
+    /// The field's DTO half is pinned in `api::health`'s tests instead.
+    #[tokio::test]
+    async fn the_api_serves_with_cookies_configured() {
+        let mut with_cookies = test_config();
+        with_cookies.medium_auth_cookies = Some("session=an-account's-real-cookie".to_string());
+
+        let mut answers = Vec::new();
+        for config in [&with_cookies, &test_config()] {
+            let recorder = Arc::new(RecordingSource(Mutex::new(Vec::new())));
+            let state = stub_state_with(config, recorder.clone());
+
+            let response = get(state, "/api/v1/posts/0291df856c77").await;
+            assert!(
+                recorder.0.lock().unwrap().is_empty(),
+                "a configured cookie reached the API's fetch path"
+            );
+
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("the problem body is small");
+            let json: Value = serde_json::from_slice(&body).expect("a problem is JSON");
+            answers.push((json["type"].clone(), json["detail"].clone()));
+        }
+
+        assert_eq!(
+            answers[0], answers[1],
+            "`MEDIUM_AUTH_COOKIES` changed what the API answers, so the API can see it"
+        );
+        assert_eq!(answers[0].0, "/problems/upstream-error");
     }
 }

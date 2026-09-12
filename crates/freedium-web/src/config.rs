@@ -67,6 +67,27 @@ pub const DEFAULT_STATIC_DIR: &str = "caddy/static";
 /// inlined so the test below can pin it.
 pub const DEFAULT_SHADOW_MODE: bool = false;
 
+/// `API_CACHE_SECONDS`' default. See [`Config::api_cache_seconds`] for why it is
+/// five minutes rather than the five hours `CACHE_LIFE_TIME` defaults to.
+pub const DEFAULT_API_CACHE_SECONDS: u64 = 300;
+
+/// The defaults for the four rate-limit pairs, grouped so the *shape* of the
+/// policy is visible in one place: the request bucket is the loose one, the miss
+/// bucket is roughly a third of it, the global budget is what the exit can take,
+/// and a token buys a looser per-IP pair **and nothing else**.
+///
+/// Tight on purpose. Every one of these can be raised by editing the environment;
+/// none of them can be un-spent after the WARP exit is exhausted, and §2.7
+/// warning 1 is that the casualty is the whole site rather than this API.
+pub const DEFAULT_API_RATE_LIMIT_PER_MINUTE: u32 = 10;
+pub const DEFAULT_API_RATE_LIMIT_BURST: u32 = 5;
+pub const DEFAULT_API_MISS_LIMIT_PER_MINUTE: u32 = 3;
+pub const DEFAULT_API_MISS_LIMIT_BURST: u32 = 1;
+pub const DEFAULT_API_FETCH_BUDGET_PER_MINUTE: u32 = 30;
+pub const DEFAULT_API_FETCH_BUDGET_BURST: u32 = 5;
+pub const DEFAULT_API_TOKEN_LIMIT_PER_MINUTE: u32 = 60;
+pub const DEFAULT_API_TOKEN_LIMIT_BURST: u32 = 20;
+
 /// Why the server could not be configured.
 ///
 /// Both cases are boot failures, not request failures: the process exits rather
@@ -121,8 +142,10 @@ pub struct Config {
     /// verbosity, including every request and response header.
     pub more_logs: bool,
 
-    /// `DISABLE_EXTERNAL_DOCS`. Accepted and logged but inert: this server has
-    /// no OpenAPI routes to disable, since §2.7 puts the public API in Fase 6.
+    /// `DISABLE_EXTERNAL_DOCS`. Fase 6 gives this its first consumer: when true,
+    /// `/api/v1/openapi.json` and `/api/v1/docs` answer a `problem+json` 404
+    /// instead of the spec. Still only a documentation question — the API itself
+    /// is unaffected, which is what the name promises.
     pub disable_external_docs: bool,
 
     /// `TIMEOUT` — the whole-request budget, the one the middleware enforces.
@@ -196,6 +219,123 @@ pub struct Config {
     /// binary is run from the repository root; a container sets it to the copy
     /// the image actually holds.
     pub static_dir: String,
+
+    // ---------------------------------------------------------------- //
+    // Fase 6 — everything `/api/v1` reads. None of it is in `config.py`,
+    // because there was no public API there; the defaults are chosen so
+    // that an environment that sets none of these still boots and still
+    // serves, with the tight limits.
+    // ---------------------------------------------------------------- //
+    /// `API_RATE_LIMIT_PER_MINUTE` / `API_RATE_LIMIT_BURST` — the per-IP bucket
+    /// every `/api/v1` request is charged against, keyed on the client address.
+    pub api_rate_limit_per_minute: u32,
+    pub api_rate_limit_burst: u32,
+
+    /// `API_MISS_LIMIT_PER_MINUTE` / `API_MISS_LIMIT_BURST` — the second per-IP
+    /// bucket, charged **only when the durable cache misses**.
+    ///
+    /// This is the one that matters, and it is deliberately much tighter than the
+    /// request bucket: a client walking the id space hits the cache zero times
+    /// while the request bucket would happily fund it. A client replaying ids
+    /// production already has cached spends nothing here, which is the behaviour
+    /// that lets a legitimate consumer page through a corpus.
+    pub api_miss_limit_per_minute: u32,
+    pub api_miss_limit_burst: u32,
+
+    /// `API_FETCH_BUDGET_PER_MINUTE` / `API_FETCH_BUDGET_BURST` — the
+    /// **process-global** budget, charged before every outbound fetch and before
+    /// every `link.medium.com` resolve.
+    ///
+    /// Global because per-IP is not enough: the thing being protected is one WARP
+    /// exit, and a distributed scrape has as many client addresses as it wants.
+    /// `RUST_REWRITE_PLAN` §2.7 warning 1 is that exhausting that exit takes the
+    /// whole site down, not just this API.
+    ///
+    /// **No token can raise this.** See [`Config::api_token`] — that is a policy
+    /// limit and this is a physical one, and conflating them is the failure this
+    /// field exists to prevent. The number is *safe, not correct*: what one exit
+    /// actually tolerates is SPIKE-1's pooled measurement, still open.
+    pub api_fetch_budget_per_minute: u32,
+    pub api_fetch_budget_burst: u32,
+
+    /// `API_TOKEN_LIMIT_PER_MINUTE` / `API_TOKEN_LIMIT_BURST` — the numbers a
+    /// caller that presents the right `X-API-TOKEN` is charged instead of the two
+    /// per-IP pair above.
+    pub api_token_limit_per_minute: u32,
+    pub api_token_limit_burst: u32,
+
+    /// `API_TOKEN` — one shared token, or `None`.
+    ///
+    /// `None` (unset **or empty**) means the tier does not exist and the header is
+    /// **ignored entirely**, not rejected: an empty default that 401s would fail
+    /// every client that sends the header to a server that never opted in.
+    ///
+    /// It is pure rate-limit identity. It does not select a `PostSource`, does
+    /// not reach `MEDIUM_AUTH_COOKIES`, and does not raise
+    /// [`Config::api_fetch_budget_per_minute`].
+    ///
+    /// One shared secret rather than §2.7's `api_keys` table, which is §2.4's
+    /// no-migration rule and one more thing to leak. Compared in constant time
+    /// (`crate::api::limit`), because a `==` on a secret is a timing oracle.
+    pub api_token: Option<String>,
+
+    /// `API_CACHE_SECONDS` — the `max-age` on the API's `Cache-Control`.
+    ///
+    /// Default **300**, and deliberately not [`Config::cache_life_time`] (five
+    /// hours). There is no purge path anywhere in this system:
+    /// `/delete-from-cache` removes a Postgres row and invalidates neither Redis
+    /// nor any CDN in front of us. A five-hour `max-age` on
+    /// `/api/v1/posts/{id}` therefore outlives a deploy, a template fix, and —
+    /// during the soak — a corrected parser, and the symptom is a consumer
+    /// reporting stale content nobody can flush. Raising this needs a purge story
+    /// first; §2.7's number was written as if one existed.
+    pub api_cache_seconds: u64,
+
+    /// `API_TRUST_PROXY` — whether to take the client address from
+    /// `X-Real-IP`/`X-Forwarded-For` instead of the socket peer.
+    ///
+    /// Default **false**, and the default is right for a direct deployment: the
+    /// headers are client-supplied unless something in front of us overwrites
+    /// them, and anything that can set its own `X-Real-IP` can pick its own
+    /// bucket.
+    ///
+    /// **Pre-deploy check, recorded rather than fixed:** production's topology
+    /// puts an external reverse proxy in front of Caddy, so `{remote_host}` — the
+    /// value Caddy writes into both headers — is that proxy. Every real client
+    /// therefore collapses into one bucket, and the per-IP limit becomes a global
+    /// 10/min. Turning this on without fixing the Caddyfile would let the client
+    /// choose; leaving it off means the limit is shared. Consuming upstream's
+    /// `X-Forwarded-For` is a Caddyfile policy change and is out of Fase 6, which
+    /// ships the flag, a `debug` log of the resolved address on every 429, and
+    /// the check below.
+    pub api_trust_proxy: bool,
+
+    /// `CORS_ALLOW_ORIGINS` — the allowlist for `/api/v1`, comma-separated.
+    ///
+    /// Empty (the default) means *no allowlist*: the API mirrors the request's
+    /// origin exactly as the page routes do, which is today's behaviour and what
+    /// an unconfigured deployment should get. Filled, the allowlist applies to
+    /// `/api/v1` **only** — the page routes keep mirroring, because their
+    /// responses are cached per-origin by nothing and a page route's CORS is part
+    /// of its byte-parity surface.
+    ///
+    /// Entries are trimmed and blanks dropped, unlike [`Config::proxy_list`]: a
+    /// stray space in `"https://a.com, https://b.com"` would otherwise make the
+    /// second origin never match, and there is no legacy behaviour to be faithful
+    /// to here.
+    pub cors_allow_origins: Vec<String>,
+
+    /// `MEDIUM_GRAPHQL_ENDPOINT` — override the GraphQL endpoint, or `None` for
+    /// `medium-client`'s real one.
+    ///
+    /// **Not a production knob.** It exists so Fase 6's 502/504 paths can be
+    /// proved end to end against a local fake GraphQL server, with no internet
+    /// and no WARP exit — the same reason the `Transport` trait exists, one level
+    /// up. Leaving it unset is the only configuration that talks to Medium.
+    ///
+    /// Empty means unset, so the default endpoint stays a single constant in
+    /// `medium-client` rather than being spelled a second time here.
+    pub medium_graphql_endpoint: Option<String>,
 }
 
 impl Config {
@@ -234,6 +374,32 @@ impl Config {
             proxy_list: parse_proxy_list(optional("PROXY_LIST")),
             port: number("PORT", DEFAULT_PORT)?,
             static_dir: text("STATIC_DIR", DEFAULT_STATIC_DIR),
+            api_rate_limit_per_minute: rate(
+                "API_RATE_LIMIT_PER_MINUTE",
+                DEFAULT_API_RATE_LIMIT_PER_MINUTE,
+            )?,
+            api_rate_limit_burst: rate("API_RATE_LIMIT_BURST", DEFAULT_API_RATE_LIMIT_BURST)?,
+            api_miss_limit_per_minute: rate(
+                "API_MISS_LIMIT_PER_MINUTE",
+                DEFAULT_API_MISS_LIMIT_PER_MINUTE,
+            )?,
+            api_miss_limit_burst: rate("API_MISS_LIMIT_BURST", DEFAULT_API_MISS_LIMIT_BURST)?,
+            api_fetch_budget_per_minute: rate(
+                "API_FETCH_BUDGET_PER_MINUTE",
+                DEFAULT_API_FETCH_BUDGET_PER_MINUTE,
+            )?,
+            api_fetch_budget_burst: rate("API_FETCH_BUDGET_BURST", DEFAULT_API_FETCH_BUDGET_BURST)?,
+            api_token_limit_per_minute: rate(
+                "API_TOKEN_LIMIT_PER_MINUTE",
+                DEFAULT_API_TOKEN_LIMIT_PER_MINUTE,
+            )?,
+            api_token_limit_burst: rate("API_TOKEN_LIMIT_BURST", DEFAULT_API_TOKEN_LIMIT_BURST)?,
+            // Empty is unset: see `Config::api_token`.
+            api_token: optional_non_empty("API_TOKEN"),
+            api_cache_seconds: number("API_CACHE_SECONDS", DEFAULT_API_CACHE_SECONDS)?,
+            api_trust_proxy: boolean("API_TRUST_PROXY", false)?,
+            cors_allow_origins: parse_origins(optional("CORS_ALLOW_ORIGINS")),
+            medium_graphql_endpoint: optional_non_empty("MEDIUM_GRAPHQL_ENDPOINT"),
         })
     }
 
@@ -275,6 +441,81 @@ fn parse_proxy_list(raw: Option<String>) -> Vec<String> {
 /// matching `os.environ`/starlette, where `FOO=` sets `FOO` to `""`.
 fn optional(name: &str) -> Option<String> {
     std::env::var(name).ok()
+}
+
+/// A variable, or `None` when unset **or empty**.
+///
+/// The difference from [`optional`] is the whole on/off switch for the two
+/// variables that use it: `API_TOKEN=` is how an operator turns the token tier
+/// off without deleting the line, and `MEDIUM_GRAPHQL_ENDPOINT=` is how an
+/// environment says "the real endpoint" rather than pointing at a stale local
+/// override. Both are *empty means default*, which is not what a bare `optional`
+/// would say — and for `API_TOKEN` the difference is a 401 for every client that
+/// sends the header.
+fn optional_non_empty(name: &str) -> Option<String> {
+    non_empty(optional(name))
+}
+
+/// [`optional_non_empty`]'s decision, isolated so it can be tested: `std::env`
+/// is global state and `set_var` is `unsafe` in edition 2024, which
+/// `unsafe_code = "forbid"` rules out — so nothing in this crate can test
+/// `from_env` itself, and the parsing has to be reachable without the
+/// environment.
+///
+/// Trims, unlike [`optional`]. Both values are used as opaque strings compared or
+/// dialled, and a `.env` line is one stray space away from a token that never
+/// matches or a URL that cannot connect. `number` and `boolean` trim for the same
+/// reason; a token whose value *intentionally* has leading whitespace cannot be
+/// sent in an HTTP header anyway.
+fn non_empty(raw: Option<String>) -> Option<String> {
+    match raw {
+        Some(raw) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// A rate limit, as a strictly positive number of requests per minute.
+///
+/// Zero is rejected rather than accepted and clamped, because the two ways it can
+/// arrive are both mistakes and neither has a graceful reading: `governor`'s
+/// `Quota` panics on a zero burst, and a zero rate means "never", which is a way
+/// of disabling an endpoint that reads like a typo. A boot failure naming the
+/// variable is the useful answer — the same reasoning as
+/// [`ConfigError::MissingAdminSecretKey`], one scale down.
+fn rate(name: &'static str, default: u32) -> Result<u32, ConfigError> {
+    positive(name, number(name, default)?)
+}
+
+/// [`rate`]'s check, isolated for the same reason as [`non_empty`].
+fn positive(name: &'static str, value: u32) -> Result<u32, ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::Invalid {
+            name,
+            value: "0".to_string(),
+            expected: "a positive number of requests per minute",
+        });
+    }
+    Ok(value)
+}
+
+/// `CORS_ALLOW_ORIGINS` → the allowlist, matching [`parse_proxy_list`]'s
+/// unset-or-empty rule but not its literalness.
+///
+/// Entries are trimmed and blanks dropped. `parse_proxy_list` keeps both because
+/// its values go straight to a URL parser that reports them and the legacy
+/// behaved that way; an origin is compared *by equality*, so a stray space would
+/// make `https://a.com` silently never match and the failure would look like a
+/// CORS bug in the browser rather than a typo in the environment.
+fn parse_origins(raw: Option<String>) -> Vec<String> {
+    match raw {
+        Some(raw) if !raw.trim().is_empty() => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn text(name: &str, default: &str) -> String {
@@ -419,6 +660,108 @@ mod tests {
         assert!(config.telegram_configured());
     }
 
+    /// Empty means *off* for `API_TOKEN` and `MEDIUM_GRAPHQL_ENDPOINT`, and the
+    /// consequence is not symmetric between them: an unset token that 401'd
+    /// would fail every client sending the header, while an empty endpoint that
+    /// became `""` would make every fetch fail with a URL parse error. Both are
+    /// why this is not a bare `optional`.
+    #[test]
+    fn an_empty_variable_is_off_not_empty() {
+        assert_eq!(non_empty(None), None, "unset");
+        assert_eq!(non_empty(Some(String::new())), None, "`FOO=`");
+        assert_eq!(non_empty(Some("   ".into())), None, "`FOO=   `");
+
+        assert_eq!(non_empty(Some("tok".into())).as_deref(), Some("tok"));
+        // Trimmed, unlike `optional`: a `.env` line's stray space must not
+        // become a token that never matches or a URL that cannot connect.
+        assert_eq!(non_empty(Some(" tok ".into())).as_deref(), Some("tok"));
+    }
+
+    /// Zero is a boot failure, not a clamped value — `governor`'s `Quota` panics
+    /// on a zero burst, so accepting one would move the failure out of the
+    /// config and into a dependency's assertion.
+    #[test]
+    fn a_rate_limit_of_zero_is_a_boot_failure() {
+        assert_eq!(positive("API_RATE_LIMIT_BURST", 5).unwrap(), 5);
+        assert_eq!(positive("API_RATE_LIMIT_BURST", 1).unwrap(), 1);
+
+        let error = positive("API_RATE_LIMIT_BURST", 0).unwrap_err();
+        let ConfigError::Invalid { name, value, .. } = error else {
+            panic!("zero must be an Invalid, not a missing-value error");
+        };
+        assert_eq!(name, "API_RATE_LIMIT_BURST");
+        assert_eq!(value, "0");
+    }
+
+    /// The shipped limits, pinned as literals rather than compared against
+    /// themselves.
+    ///
+    /// The direction that matters: these can be raised by editing an
+    /// environment, but an exhausted WARP exit cannot be un-spent, and §2.7
+    /// warning 1 is that the casualty is the whole site rather than this API. A
+    /// change here should be a deliberate edit to this test, not a silent one.
+    ///
+    /// The relationships are pinned too, because they are the policy: the global
+    /// fetch budget sits **above** a single client's miss rate (otherwise a lone
+    /// scraper could starve the site) and **below** what a token unlocks
+    /// (otherwise the token tier would raise a physical limit, which is the one
+    /// thing it must not do).
+    #[test]
+    fn the_api_limits_are_the_tight_defaults() {
+        assert_eq!(DEFAULT_API_RATE_LIMIT_PER_MINUTE, 10);
+        assert_eq!(DEFAULT_API_RATE_LIMIT_BURST, 5);
+        assert_eq!(DEFAULT_API_MISS_LIMIT_PER_MINUTE, 3);
+        assert_eq!(DEFAULT_API_MISS_LIMIT_BURST, 1);
+        assert_eq!(DEFAULT_API_FETCH_BUDGET_PER_MINUTE, 30);
+        assert_eq!(DEFAULT_API_FETCH_BUDGET_BURST, 5);
+        assert_eq!(DEFAULT_API_TOKEN_LIMIT_PER_MINUTE, 60);
+        assert_eq!(DEFAULT_API_TOKEN_LIMIT_BURST, 20);
+
+        // Five hours of `CACHE_LIFE_TIME` is the number this must never become:
+        // there is no purge path, so a consumer would report stale content that
+        // nobody can flush.
+        assert_eq!(DEFAULT_API_CACHE_SECONDS, 300);
+
+        const {
+            assert!(DEFAULT_API_MISS_LIMIT_PER_MINUTE < DEFAULT_API_FETCH_BUDGET_PER_MINUTE);
+            assert!(DEFAULT_API_FETCH_BUDGET_PER_MINUTE < DEFAULT_API_TOKEN_LIMIT_PER_MINUTE);
+            assert!(DEFAULT_API_RATE_LIMIT_BURST < DEFAULT_API_TOKEN_LIMIT_BURST);
+        }
+
+        assert_eq!(sample().api_token, None, "the tier is off by default");
+    }
+
+    /// The allowlist trims and drops blanks — see [`parse_origins`] — and an
+    /// unconfigured deployment gets no allowlist at all, which the CORS layer
+    /// reads as "mirror the origin", today's behaviour.
+    #[test]
+    fn the_cors_allowlist_is_empty_unless_it_is_filled() {
+        assert!(parse_origins(None).is_empty(), "unset");
+        assert!(parse_origins(Some(String::new())).is_empty(), "empty");
+        assert!(parse_origins(Some("  ".into())).is_empty(), "blank");
+
+        assert_eq!(
+            parse_origins(Some("https://a.example".into())),
+            vec!["https://a.example"]
+        );
+        assert_eq!(
+            parse_origins(Some("https://a.example, https://b.example".into())),
+            vec!["https://a.example", "https://b.example"],
+            "a space after the comma is a typo, not an origin"
+        );
+        assert_eq!(
+            parse_origins(Some("https://a.example,,https://b.example".into())),
+            vec!["https://a.example", "https://b.example"],
+            "an empty entry would never match any request's Origin"
+        );
+    }
+
+    /// A literal rather than [`Config::from_env`], which is not a convenience:
+    /// `std::env::set_var` is `unsafe` in edition 2024 and `unsafe_code =
+    /// "forbid"` rules it out, so no test in this crate can point `from_env` at a
+    /// known environment. That is why the parsing decisions live in pure helpers
+    /// (`non_empty`, `positive`, `parse_origins`, `boolean_from`) and are tested
+    /// there.
     fn sample() -> Config {
         Config {
             host_address: DEFAULT_HOST_ADDRESS.into(),
@@ -443,6 +786,23 @@ mod tests {
             proxy_list: Vec::new(),
             port: DEFAULT_PORT,
             static_dir: DEFAULT_STATIC_DIR.into(),
+            // The shipped defaults, so a test that reads one of these is reading
+            // what a deployment gets rather than a number invented here.
+            api_rate_limit_per_minute: DEFAULT_API_RATE_LIMIT_PER_MINUTE,
+            api_rate_limit_burst: DEFAULT_API_RATE_LIMIT_BURST,
+            api_miss_limit_per_minute: DEFAULT_API_MISS_LIMIT_PER_MINUTE,
+            api_miss_limit_burst: DEFAULT_API_MISS_LIMIT_BURST,
+            api_fetch_budget_per_minute: DEFAULT_API_FETCH_BUDGET_PER_MINUTE,
+            api_fetch_budget_burst: DEFAULT_API_FETCH_BUDGET_BURST,
+            api_token_limit_per_minute: DEFAULT_API_TOKEN_LIMIT_PER_MINUTE,
+            api_token_limit_burst: DEFAULT_API_TOKEN_LIMIT_BURST,
+            // Off. `API_TOKEN` unset is the default deployment, and the tests
+            // that want the tier set one explicitly.
+            api_token: None,
+            api_cache_seconds: DEFAULT_API_CACHE_SECONDS,
+            api_trust_proxy: false,
+            cors_allow_origins: Vec::new(),
+            medium_graphql_endpoint: None,
         }
     }
 }

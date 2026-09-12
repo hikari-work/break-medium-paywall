@@ -56,16 +56,26 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 
+use crate::api;
+use crate::config::Config;
 use crate::handlers::{main, misc};
 use crate::middleware;
 use crate::state::AppState;
 
 /// The two page handlers, as one `MethodRouter`.
 ///
-/// `get` does **not** imply `head` in axum, and the legacy registers both
-/// (`handlers/main.py:71`) — so a `HEAD /some/post` has to run the whole resolve
-/// and render and then drop the body, exactly as FastAPI does. Without `.head()`
-/// it would be a 405.
+/// # The `.head()`s are redundant, and are kept
+///
+/// This comment used to say that `get` does not imply `head` in axum. That is
+/// false as of 0.8: `MethodRouter::get` puts `GET,HEAD` in its `Allow` header and
+/// a `HEAD` is routed to the `get` handler, whose body is then emptied
+/// (`routing/route.rs`, `RouteFuture::poll`). The explicit `.head()` therefore
+/// changes nothing at all — the same `main::dispatch` runs either way.
+///
+/// They are kept because the legacy registers both (`handlers/main.py:71`) and
+/// because removing them is a change to the page routes with no observable
+/// benefit; the API's routes, which are new, rely on axum's behaviour instead —
+/// see `api::openapi`'s docs for why that is the better side of the trade.
 ///
 /// `/` is registered separately from `/{*path}` because matchit does not
 /// guarantee that a catch-all matches the empty path. Both point at
@@ -87,10 +97,26 @@ fn pages(state: AppState) -> Router {
 pub fn router(state: AppState) -> Router {
     let static_dir = state.config.static_dir.clone();
     let pages = pages(state.clone());
+    // `Router<AppState>` and **not** a stated router: `.nest()` requires a router
+    // whose state has not been applied. `crate::api::router` is written for this
+    // and `pages` is not, which is the whole of the difference between the two.
+    let api = api::router(state.clone());
+    let config = state.config.clone();
 
     Router::new()
         .route("/delete-from-cache", post(misc::delete_from_cache))
         .route("/report-problem", post(misc::report_problem))
+        // **Before the fallback and before every `.layer()` below, and both
+        // halves of that matter.** `Router::layer` wraps the routes *and the
+        // fallback* that exist at the moment it is called, so anything added
+        // afterwards is outside all of them: a `.nest()` below these lines would
+        // be an API with no correlation, no CORS and no compression. And the
+        // fallback has to come after the nest for the same family of reasons —
+        // `ServeDir`'s fallback is the page catch-all, which would otherwise be
+        // reachable for a mistyped `/api/v1` path. (matchit prefers a static
+        // segment over a wildcard, so the two do not actually overlap today; the
+        // ordering is what makes that a property rather than a coincidence.)
+        .nest("/api/v1", api)
         // **The fallback is registered before the layers, and that is not
         // cosmetic.** `Router::layer` wraps the routes *and the fallback* that
         // exist at the moment it is called; anything added afterwards is outside
@@ -103,6 +129,12 @@ pub fn router(state: AppState) -> Router {
         // inherited from `DefaultBodyLimit` and is far more than either route can
         // use; 16 KB is generous for a description and a URL, and keeps an
         // unauthenticated POST from being a way to make the process allocate.
+        //
+        // **It stays here.** Every `/api/v1` route is a GET with no body
+        // extractor — `/resolve?url=` is a query string, which this limit does
+        // not see — so moving it inside the nest would change nothing for the
+        // API and would stop covering the two admin POSTs, which are the routes
+        // that need it.
         .layer(DefaultBodyLimit::max(16 * 1024))
         // Innermost of the layers: catches a panicking handler while the
         // correlation is still reachable. See the module docs.
@@ -114,7 +146,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             middleware::correlation,
         ))
-        .layer(cors())
+        .layer(cors(&config))
         // Outermost, because production gzips at the edge and this is the
         // standalone equivalent: `caddy/Caddyfile`'s `common` snippet ends with
         // `encode gzip`, so a response from a deployed Freedium is compressed and
@@ -169,7 +201,32 @@ pub fn router(state: AppState) -> Router {
 /// (`cors.py:172`), `tower-http` always does. With every origin allowed it is a
 /// cache hint rather than a poisoning risk, and CORS headers are not part of
 /// the post-page parity gate (decision 1).
-fn cors() -> CorsLayer {
+///
+/// # `CORS_ALLOW_ORIGINS` closes the API and leaves the pages alone
+///
+/// The config is the whole of the difference, and an **empty** list — the
+/// default — is exactly the behaviour above, so a deployment that never sets it
+/// gets no change at all.
+///
+/// When it is set, the predicate splits on the path: a request under `/api/`
+/// must come from a listed origin, and everything else keeps the mirror. Two
+/// reasons for the path split rather than a second `CorsLayer`:
+///
+/// - **Only one `CorsLayer` may exist.** Two would each add
+///   `Access-Control-Allow-Origin`, and a duplicated header is one browsers
+///   reject.
+/// - The pages are embedded in other people's sites and are read by browsers
+///   directly; locking them down is a different decision with a different blast
+///   radius, and it is not this one. What the allowlist is for is the API — a
+///   JSON contract a third party's front-end calls — where an allowlist is the
+///   difference between "any site can drive our rate limits from its visitors'
+///   browsers" and "only the sites we named can".
+///
+/// `parts.uri.path()` is the full path, because this layer wraps the nest rather
+/// than sitting inside it. The comparison is exact and case-sensitive, which is
+/// what an origin is: a browser sends the scheme, host and port, lowercased for
+/// the scheme and host, and never a trailing slash.
+fn cors(config: &Config) -> CorsLayer {
     /// `ALL_METHODS` (`starlette/middleware/cors.py:11`), in its own order — the
     /// header is a joined list, so the order is observable.
     const ALL_METHODS: [Method; 7] = [
@@ -182,8 +239,23 @@ fn cors() -> CorsLayer {
         Method::PUT,
     ];
 
+    let allow_origin = if config.cors_allow_origins.is_empty() {
+        AllowOrigin::mirror_request()
+    } else {
+        let allowed = config.cors_allow_origins.clone();
+        AllowOrigin::predicate(move |origin, parts| {
+            if !parts.uri.path().starts_with("/api/") {
+                return true;
+            }
+            let Ok(origin) = origin.to_str() else {
+                return false;
+            };
+            allowed.iter().any(|entry| entry == origin)
+        })
+    };
+
     CorsLayer::new()
-        .allow_origin(AllowOrigin::mirror_request())
+        .allow_origin(allow_origin)
         .allow_credentials(true)
         .allow_methods(AllowMethods::list(ALL_METHODS))
         .allow_headers(AllowHeaders::mirror_request())

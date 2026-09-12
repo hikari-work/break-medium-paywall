@@ -242,6 +242,26 @@ mod tests {
             proxy_list: Vec::new(),
             port: 7080,
             static_dir: "caddy/static".into(),
+            // Deliberately not `state::tests::test_config()`, however tempting
+            // the duplication looks: this fixture varies `host_address`,
+            // `cache_life_time` and the Redis and Postgres targets on purpose,
+            // and inheriting those from the state fixture would make this test
+            // depend on values it does not read. The Fase 6 API fields are here
+            // only because the struct has no `Default` — this test reads neither
+            // of them.
+            api_rate_limit_per_minute: 10,
+            api_rate_limit_burst: 5,
+            api_miss_limit_per_minute: 3,
+            api_miss_limit_burst: 1,
+            api_fetch_budget_per_minute: 30,
+            api_fetch_budget_burst: 5,
+            api_token_limit_per_minute: 60,
+            api_token_limit_burst: 20,
+            api_token: None,
+            api_cache_seconds: 300,
+            api_trust_proxy: false,
+            cors_allow_origins: Vec::new(),
+            medium_graphql_endpoint: None,
         };
         Notifier::new(transport, &config)
     }

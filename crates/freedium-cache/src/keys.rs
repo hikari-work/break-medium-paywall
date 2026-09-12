@@ -24,7 +24,7 @@ pub const NAMESPACE: &str = "v2";
 /// Replaces the bare `{post_id}` key. Note the legacy key had no prefix at all,
 /// so this cannot collide with it.
 pub fn post_key(post_id: &str) -> String {
-    format!("{NAMESPACE}:post:{post_id}")
+    format!("{POST_PREFIX}{post_id}")
 }
 
 /// The homepage's rendered post list, as MessagePack.
@@ -35,6 +35,24 @@ pub fn post_key(post_id: &str) -> String {
 /// it is a constant here rather than a function.
 pub const HOMEPAGE_KEY: &str = "v2:homepage";
 
+/// The prefix every [`post_key`] shares, so a caller can page over the post rows
+/// of a table that holds other keys too.
+pub const POST_PREFIX: &str = "v2:post:";
+
+/// The post id inside a [`post_key`], or `None` for a key that is not one.
+///
+/// The inverse of [`post_key`], and it lives here for the same reason: the prefix
+/// is this module's business. `/api/v1/feed` walks the `cache` table in key order
+/// and needs the id back to serve a row's metadata, and it must not be the module
+/// that knows the namespace is spelled `v2:post:`.
+///
+/// An empty id (`"v2:post:"` exactly) is `None`: `post_key("")` is not a post.
+/// The id keeps everything after the prefix, including any `:` in it — see
+/// `post_key_keeps_the_id_at_the_end`.
+pub fn post_id_from_key(key: &str) -> Option<&str> {
+    key.strip_prefix(POST_PREFIX).filter(|id| !id.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,6 +60,23 @@ mod tests {
     #[test]
     fn post_key_is_namespaced() {
         assert_eq!(post_key("515dd5a43948"), "v2:post:515dd5a43948");
+        assert_eq!(POST_PREFIX, "v2:post:", "the prefix is spelled once, here");
+    }
+
+    /// The feed reads a row's id back out of its key, so the two must be exact
+    /// inverses — including for an id that contains the separator.
+    #[test]
+    fn the_id_round_trips_out_of_the_key() {
+        for id in ["515dd5a43948", "a:b", "a"] {
+            assert_eq!(post_id_from_key(&post_key(id)), Some(id));
+        }
+        assert_eq!(
+            post_id_from_key(&post_key("")),
+            None,
+            "an empty id is no post"
+        );
+        assert_eq!(post_id_from_key(HOMEPAGE_KEY), None);
+        assert_eq!(post_id_from_key(""), None);
     }
 
     /// The whole point of §2.4: a Rust write must not be visible to a Python

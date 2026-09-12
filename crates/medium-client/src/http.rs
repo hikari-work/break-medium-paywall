@@ -348,6 +348,71 @@ impl<T: Transport + 'static> PostSource for HttpPostSource<T> {
     }
 }
 
+/// A [`PostSource`] that cannot carry credentials.
+///
+/// # Why this exists at all
+///
+/// `RUST_REWRITE_PLAN.md` §2.7 warns that the public API must not be served
+/// anonymously from an instance that sets `MEDIUM_AUTH_COOKIES`, because the
+/// unlocks that cookie performs are quota-bound to a real account — and its own
+/// suggested mitigation ("don't expose the API there") does not apply, because
+/// the configuration that must set the cookie is the production one. So the
+/// replacement is not a runtime check but a construction guarantee: **there is no
+/// path from this type to [`HttpPostSource::with_auth_cookies`]**, because this
+/// type's only constructor builds its own `HttpPostSource` from the raw
+/// ingredients — a transport, a pool, a timeout, an endpoint — and never sees a
+/// cookie to attach.
+///
+/// # The limit of the guarantee, stated rather than implied
+///
+/// This makes "the API forgot to drop the cookie" impossible *from an anonymous
+/// handle*. It does not stop someone writing `state.source` — the page's own,
+/// cookie-bearing source — inside an API handler. Nothing at this level can: the
+/// two are the same trait object type. What closes that is the handler test in
+/// `freedium-web::state`, which checks the API path against a recording source and
+/// the page path against the same recording source, so neither assertion can pass
+/// vacuously.
+///
+/// Do not add `with_auth_cookies` here, and do not add a constructor that takes an
+/// already-built [`HttpPostSource`] — either one would re-open what this closes.
+#[derive(Clone)]
+pub struct AnonymousSource {
+    inner: Arc<dyn PostSource>,
+}
+
+impl AnonymousSource {
+    /// Builds a source with no credentials and no way to acquire any.
+    ///
+    /// `endpoint` is [`request::ENDPOINT`] in production; `MEDIUM_GRAPHQL_ENDPOINT`
+    /// overrides it so the upstream-failure paths can be exercised against a local
+    /// server.
+    pub fn new<T: Transport + 'static>(
+        transport: T,
+        pool: Arc<ProxyPool>,
+        timeout: Duration,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(
+                HttpPostSource::new(transport, pool)
+                    .with_timeout(timeout)
+                    .with_endpoint(endpoint),
+            ),
+        }
+    }
+
+    /// The underlying source, for the tests that compare it against the page's by
+    /// pointer identity. Handlers should call [`Self::fetch_post`] instead.
+    pub fn inner(&self) -> &Arc<dyn PostSource> {
+        &self.inner
+    }
+
+    /// One post, over an anonymous transport.
+    pub async fn fetch_post(&self, post_id: &str) -> Result<Value, FetchError> {
+        self.inner.fetch_post(post_id).await
+    }
+}
+
 /// A character-safe prefix of a response body, for the `Status` error.
 ///
 /// The body of a rejected GraphQL request is small, but a proxy or CDN error
@@ -373,7 +438,8 @@ mod tests {
     use super::*;
     use crate::proxy::ProxyEndpoint;
     use crate::test_support::{
-        AlwaysHealthy, Behaviour, CountingSleeper, Stub, direct_pool, http_ok, http_status,
+        AlwaysHealthy, Behaviour, CountingSleeper, ScriptedTransport, Stub, direct_pool, http_ok,
+        http_status,
     };
     use std::time::Duration;
 
@@ -580,5 +646,127 @@ mod tests {
     #[test]
     fn preview_tolerates_invalid_utf8() {
         assert!(preview(&[0xff, 0xfe]).contains('\u{fffd}'));
+    }
+
+    // ---------------------------------------------------------------------
+    // The anonymous source, and the cookie pair
+    // ---------------------------------------------------------------------
+    //
+    // These two tests are only meaningful together. The first alone would pass in
+    // a crate where nothing ever set a `Cookie` header at all — a test of an
+    // absence that proves nothing. The second is what makes it a test of *this*
+    // code: the same question, asked of a source that is configured to send one.
+
+    /// Fails if any credential-bearing header is on the wire.
+    fn assert_no_credentials(requests: &[TransportRequest]) {
+        for request in requests {
+            // Non-vacuity: a request carrying no headers at all would satisfy the
+            // loop below without testing anything.
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("user-agent")),
+                "the request carries headers, so `cookie` being absent means something"
+            );
+            for (name, _) in &request.headers {
+                assert!(
+                    !name.eq_ignore_ascii_case("cookie")
+                        && !name.eq_ignore_ascii_case("authorization"),
+                    "{name} reached the wire: {:?}",
+                    request.headers
+                );
+            }
+        }
+    }
+
+    /// A transport that always answers 200 with [`VALID`], recording what it sent.
+    fn scripted_ok() -> ScriptedTransport {
+        ScriptedTransport::new(
+            vec![],
+            crate::test_support::response(
+                200,
+                &[("content-type", "application/json")],
+                VALID.as_bytes(),
+            ),
+        )
+    }
+
+    fn anonymous(transport: ScriptedTransport) -> AnonymousSource {
+        AnonymousSource::new(
+            transport,
+            direct_pool(),
+            Duration::from_secs(5),
+            "http://127.0.0.1:1",
+        )
+    }
+
+    /// **The API's source cannot carry the account's session.**
+    #[tokio::test]
+    async fn the_anonymous_source_sends_no_cookie_header() {
+        let transport = scripted_ok();
+        let payload = anonymous(transport.clone())
+            .fetch_post("abc")
+            .await
+            .expect("the script is a 200");
+
+        assert_eq!(
+            payload["data"]["post"]["id"], "abc",
+            "the anonymous source really did fetch, rather than failing early"
+        );
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1, "one attempt, one request");
+        assert_no_credentials(&requests);
+    }
+
+    /// **The contrast that gives the test above its meaning.**
+    ///
+    /// `HttpPostSource` *can* send the cookie. This is the same question asked of
+    /// a source that is told to, and it fails if the header-writing code ever
+    /// stops being reachable — which is exactly the way
+    /// `the_anonymous_source_sends_no_cookie_header` would otherwise pass for the
+    /// wrong reason.
+    #[tokio::test]
+    async fn an_authenticated_source_does_send_the_cookie_header() {
+        let transport = scripted_ok();
+        let source = HttpPostSource::new(transport.clone(), direct_pool())
+            .with_endpoint("http://127.0.0.1:1")
+            .with_timeout(Duration::from_secs(5))
+            .with_auth_cookies(Some("sid=secret; uid=42".into()));
+
+        source.fetch_post("abc").await.expect("the script is a 200");
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("cookie")
+                    && value == "sid=secret; uid=42"),
+            "the cookie path exists, so its absence from the anonymous source is \
+             the newtype doing work: {:?}",
+            requests[0].headers
+        );
+    }
+
+    /// The anonymous source keeps the rest of the path: the retry loop, the body,
+    /// the endpoint. A source that quietly failed early would satisfy the cookie
+    /// test for the wrong reason, so this asks the question the other way round.
+    #[tokio::test]
+    async fn the_anonymous_source_still_retries_and_reports() {
+        let transport = ScriptedTransport::new(
+            vec![Ok(crate::test_support::response(500, &[], b"boom"))],
+            crate::test_support::response(200, &[], VALID.as_bytes()),
+        );
+
+        let payload = anonymous(transport.clone())
+            .fetch_post("abc")
+            .await
+            .expect("the second reply is a 200");
+        assert_eq!(payload["data"]["post"]["id"], "abc");
+        assert_eq!(transport.request_count(), 2, "the 500 was retried");
+        assert_no_credentials(&transport.requests());
     }
 }

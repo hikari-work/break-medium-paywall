@@ -237,6 +237,80 @@ impl PostgresCache {
         Ok(self.len().await? == 0)
     }
 
+    /// `SELECT 1` — is this database answering at all.
+    ///
+    /// # Why not [`Self::len`]
+    ///
+    /// `/api/v1/health` needs one bit: can we reach Postgres. `len` is
+    /// `SELECT COUNT(*)` over the whole `cache` table, which at production size is
+    /// a sequential scan of the largest relation in the system — run by every
+    /// monitor every few seconds, for a number nothing reads. This asks the
+    /// cheapest question that answers "is it up", and the caller bounds it with a
+    /// timeout of its own.
+    ///
+    /// It deliberately does **not** check that the `cache` table exists. A missing
+    /// table is a boot-order problem, not a liveness one, and `init_db` is the
+    /// thing that fixes it.
+    pub async fn probe(&self) -> Result<(), CacheError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Up to `size` `(key, value)` rows whose key starts with `prefix`, in key
+    /// order, starting strictly after `cursor`.
+    ///
+    /// # What this is for, and what it is not
+    ///
+    /// This is the only query in the crate with a **stable order**, which is what
+    /// `/api/v1/feed`'s cursor needs. It is deliberately not "the next N posts by
+    /// date": the table is `(key TEXT PRIMARY KEY, value TEXT)` and the value is a
+    /// JSON blob, so there is no column to sort by (§2.4 forbids adding one). The
+    /// order is therefore **by key** — stable and resumable, but arbitrary as a
+    /// *reading* order, and the endpoint says so rather than letting a consumer
+    /// discover it.
+    ///
+    /// [`Self::random`] cannot serve this: `TABLESAMPLE` has no order to resume
+    /// from, so a cursor over it is meaningless.
+    ///
+    /// # `prefix` and `cursor` are different things
+    ///
+    /// `prefix` is the namespace to page over — `keys::post_key`'s `"v2:post:"`.
+    /// `cursor` is the last key the caller saw, or `None` for the beginning. The
+    /// `None` case binds `prefix` itself, which is correct rather than a special
+    /// case: every key in the namespace is `prefix` followed by at least one more
+    /// character, so all of them compare greater than `prefix` — and a key that is
+    /// *exactly* `prefix` (an empty post id) is not a post and is excluded, which
+    /// is what we want.
+    ///
+    /// The prefix test is `left(key, length($1)) = $1` rather than `LIKE $1 || '%'`
+    /// because `LIKE` would treat a `_` or `%` in the prefix as a wildcard. That
+    /// costs the index on the prefix alone, but `key > $cursor` plus `ORDER BY
+    /// key` still walks the primary-key index in order and stops as soon as `size`
+    /// rows match, so the filter never forces a full sort.
+    pub async fn page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        size: i64,
+    ) -> Result<Vec<(String, String)>, CacheError> {
+        let rows = sqlx::query(
+            "SELECT key, value FROM cache
+             WHERE left(key, length($1)) = $1 AND key > $2
+             ORDER BY key
+             LIMIT $3",
+        )
+        .bind(prefix)
+        .bind(cursor.unwrap_or(prefix))
+        .bind(size)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("key"), row.get("value")))
+            .collect())
+    }
+
     /// Up to `size` arbitrary `(key, value)` rows.
     ///
     /// # This deliberately does not port `ORDER BY RANDOM()`
@@ -679,6 +753,109 @@ mod tests {
             .execute(cache.pool())
             .await
             .expect("can remove the scratch ban");
+    }
+
+    /// `probe` answers on a reachable database.
+    ///
+    /// What this really covers is the *statement*: a typo in it would only show
+    /// up here, and `/api/v1/health` is the endpoint that has to be right when
+    /// everything else is wrong. The method's doc says why it is not a `COUNT(*)`.
+    #[tokio::test]
+    #[ignore = "needs FREEDIUM_TEST_DATABASE_URL"]
+    async fn probe_answers_on_a_reachable_database() {
+        let cache = connect().await;
+        cache.probe().await.expect("a reachable database probes ok");
+    }
+
+    /// **The feed's contract, end to end.**
+    ///
+    /// Rows come back in key order, the cursor resumes strictly after the last
+    /// one, and a second page shares nothing with the first. This is what
+    /// `/api/v1/feed` is built on, and no unit test can check it: the ordering is
+    /// the database's, not ours.
+    #[tokio::test]
+    #[ignore = "needs FREEDIUM_TEST_DATABASE_URL"]
+    async fn page_walks_a_prefix_in_key_order() {
+        let cache = connect().await;
+        let prefix = scratch_key("page:");
+
+        // Deliberately inserted out of order, so an implementation that returned
+        // insertion order would fail rather than pass by luck.
+        let keys: Vec<String> = ["d", "a", "c", "b"]
+            .iter()
+            .map(|suffix| format!("{prefix}{suffix}"))
+            .collect();
+        for key in &keys {
+            cache.push(key, "{}").await.unwrap();
+        }
+
+        let first = cache.page(&prefix, None, 2).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec![keys[1].as_str(), keys[3].as_str()],
+            "the order is by key, so a before b — not the insertion order"
+        );
+
+        let second = cache.page(&prefix, Some(&first[1].0), 2).await.unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec![keys[2].as_str(), keys[0].as_str()],
+            "resuming after b gives c, d"
+        );
+
+        let third = cache.page(&prefix, Some(&second[1].0), 2).await.unwrap();
+        assert!(third.is_empty(), "the prefix is exhausted");
+
+        clean_up(&cache, &keys).await;
+    }
+
+    /// `size` is a limit, not a target: a prefix with fewer rows returns what
+    /// there is, and the caller can tell from the length.
+    #[tokio::test]
+    #[ignore = "needs FREEDIUM_TEST_DATABASE_URL"]
+    async fn page_returns_what_exists_when_the_prefix_is_short() {
+        let cache = connect().await;
+        let prefix = scratch_key("short:");
+        let key = format!("{prefix}only");
+        cache.push(&key, "value").await.unwrap();
+
+        let rows = cache.page(&prefix, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "value", "the value is returned raw");
+
+        clean_up(&cache, &[key]).await;
+    }
+
+    /// **The prefix test must not be a `LIKE` pattern.**
+    ///
+    /// `_` is a single-character wildcard in `LIKE`, and the key namespace is
+    /// caller-supplied. A prefix containing one would otherwise match a key it
+    /// should not, which is the difference between a feed page and a leak of
+    /// another namespace's rows.
+    #[tokio::test]
+    #[ignore = "needs FREEDIUM_TEST_DATABASE_URL"]
+    async fn page_does_not_treat_the_prefix_as_a_wildcard() {
+        let cache = connect().await;
+        let base = scratch_key("wild");
+        let real = format!("{base}_x:real");
+        let decoy = format!("{base}Qx:decoy");
+        cache.push(&real, "real").await.unwrap();
+        cache.push(&decoy, "decoy").await.unwrap();
+
+        let rows = cache.page(&format!("{base}_x:"), None, 10).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            vec![real.as_str()],
+            "`_` matched itself, not any character"
+        );
+
+        clean_up(&cache, &[real, decoy]).await;
     }
 
     /// `banned_at` as stored, for the idempotency assertion.

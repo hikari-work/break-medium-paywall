@@ -32,6 +32,7 @@ use freedium_cache::decode::decode_json;
 use freedium_cache::keys;
 use medium_client::error::FetchError;
 use medium_client::response::validate;
+use medium_client::source::PostSource;
 use medium_doc::metadata::{self, PostMetadata};
 use medium_doc::parse::{PostPayload, parse};
 use medium_doc::resolve::{
@@ -57,7 +58,8 @@ pub const MSG_NO_ARTICLE: &str = "Unable to identify the link as a Medium.com ar
 ///
 /// **Unreferenced, on purpose.** Nothing in `medium_parser` ever raises that
 /// exception, so the branch that renders this message is dead code and there is
-/// no [`PageError`] here that carries it — see [`fetch_error`]. The constant
+/// no [`PageError`] here that carries it — see `impl From<FetchFailure> for
+/// PageError`. The constant
 /// stays so that a reader comparing this file against `handlers/post.py:72-89`
 /// can find all four messages in one place rather than wondering which is
 /// missing.
@@ -246,7 +248,7 @@ pub async fn render_medium_post_link(
 
     let post_id = match resolve_id(state, path).await {
         Ok(post_id) => post_id,
-        Err(error) => return html_error(state, correlation, error).await,
+        Err(error) => return html_error(state, correlation, error.into()).await,
     };
     // `keys::post_key` — the `v2:` prefix is what keeps this from colliding with
     // the Python instance's unprefixed keys during Fase 4's shadow traffic.
@@ -301,11 +303,123 @@ pub async fn render_medium_post_link(
     html(rendered.html)
 }
 
+/// Why a fetch did not produce a payload.
+///
+/// # Why this exists rather than a bare [`PageError`]
+///
+/// The page route collapses every failure onto one status (`handlers/post.py`'s
+/// exception table is why), but `/api/v1` cannot: §2.7 gives 404, 502, 503 and 504
+/// to four different causes that the page answers identically. A typed failure is
+/// the only way both tables can be right over the same code — the page converts
+/// through [`From`] and gets today's bytes, and the API matches on the variants
+/// and gets its own.
+///
+/// Splitting the fetch out of [`query`] is what makes the variants *visible*: a
+/// function that returns a `PageError` has already thrown the distinction away.
+#[derive(Debug)]
+pub enum FetchFailure {
+    /// `SHADOW_MODE` is on and the durable cache missed: this instance will not go
+    /// to the network. Fase 4's interlock — see [`query`].
+    Declined,
+
+    /// The fetch itself failed. The page answers 404 for all of
+    /// [`FetchError`]'s variants; the API reads the variant.
+    Fetch(FetchError),
+
+    /// A payload that `validate` accepted could not be turned into a
+    /// [`PostPayload`].
+    ///
+    /// **Unreachable**, because `fetch_post` promises a validated payload and
+    /// `serde` accepts anything `validate` lets through. Kept as its own variant
+    /// rather than an `expect`, so the answer is the 500 the legacy's generic
+    /// `except Exception` gives rather than a dropped connection — and so a
+    /// caller that wants to distinguish "upstream is broken" from "our own
+    /// invariant broke" can.
+    NotAPayload(String),
+}
+
+/// Why a path did not resolve to a post id.
+///
+/// Three variants, not four: the plan sketched a `ShortLink(FetchError)` for the
+/// `link.medium.com` hop, and there is nowhere to put it. `LinkResolver` returns
+/// `Option<String>` and a failed hop becomes `None`, which resolves to
+/// [`Self::NoArticle`] — `medium-doc` cannot see a `FetchError`, and teaching it
+/// to would invert §2.6's layering for a distinction the legacy does not make
+/// either (its `InvalidMediumPostURL` covers both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveError {
+    /// `InvalidURL` — `handlers/post.py:73-77`. The input is not an absolute URL
+    /// at all.
+    InvalidUrl,
+
+    /// `NotValidMediumURL` — `handlers/post.py:87`. A real URL, on a domain known
+    /// not to be Medium's.
+    NotValidMediumUrl,
+
+    /// `InvalidMediumPostURL` — `handlers/post.py:78-83`. A plausible Medium URL
+    /// from which no post id could be read.
+    NoArticle,
+}
+
+/// The page's table: 404 twice, quietly once, and a 500.
+///
+/// **Every string here is the legacy's, verbatim**, which is what lets
+/// [`resolve_id`] and [`query`] change shape without the rendered pages changing
+/// at all. The difftest gate is what proves it, and it was re-run after this
+/// refactor for exactly that reason.
+impl From<ResolveError> for PageError {
+    fn from(error: ResolveError) -> Self {
+        match error {
+            ResolveError::InvalidUrl => PageError::new(MSG_INVALID_URL, 404),
+            // Quiet: `utils/error.py:39-40` — a mistyped URL is routine traffic,
+            // so it does not reach Telegram.
+            ResolveError::NotValidMediumUrl => PageError::new(MSG_NOT_VALID_URL, 404).quiet(),
+            ResolveError::NoArticle => PageError::new(MSG_NO_ARTICLE, 404),
+        }
+    }
+}
+
+/// The same, for a failed fetch.
+///
+/// # Why every fetch failure is a 404 here, against `handlers/post.py`'s four
+/// branches
+///
+/// The legacy maps six exception types onto four branches, and
+/// `InvalidMediumPostID` — the only one that gets a 500
+/// (`handlers/post.py:84-85`) — is **never raised**. It is defined in
+/// `medium_parser_exceptions` and caught there, and that is the whole of its
+/// existence: nothing in `medium_parser` raises it. So a [`FetchError`] cannot be
+/// that, and the two failures the legacy's `query` actually produces are
+/// `MediumPostQueryError` (`core.py:202`, when the retry loop gives up) and the
+/// `InvalidMediumPostURL` of a URL whose id does not resolve — both 404. The shape
+/// problem that looks like it should be a 500 is not: `validate` runs inside
+/// `fetch_post`, and its `NoPost`/`Malformed`/`GraphQl` variants are exactly what
+/// the legacy's `reason` checks turn into a retry and then a
+/// `MediumPostQueryError`.
+///
+/// **§2.7 says something different on purpose, and only for the API** — it makes
+/// a failed upstream fetch a 502, because a 404 from Medium for an id we believe
+/// is valid is an upstream anomaly rather than a statement about our URL space.
+/// That divergence is the API's to make, in `crate::api`, and this conversion
+/// stays as it is so the pages do not move.
+impl From<FetchFailure> for PageError {
+    fn from(failure: FetchFailure) -> Self {
+        match failure {
+            // A decline is not a failure to fetch; it is a refusal to try. It
+            // keeps its own status and its marker header so the edge skips it.
+            FetchFailure::Declined => PageError::declined(SHADOW_NO_FETCH),
+            FetchFailure::Fetch(_) => PageError::new(MSG_NO_ARTICLE, 404),
+            FetchFailure::NotAPayload(_) => PageError::unspecified(),
+        }
+    }
+}
+
 /// `MediumParser.resolve` (`core.py:69-101`), including the hex fallback.
 ///
-/// Returns the [`PageError`] the caller should render, so the status-code table
-/// stays in one place.
-pub async fn resolve_id(state: &AppState, path: &str) -> Result<String, PageError> {
+/// Returns the [`ResolveError`] the caller should map, so the status-code table
+/// stays in one place — and so `/api/v1/resolve` can answer 400 where the page
+/// answers 404 without either one lying about what happened.
+pub async fn resolve_id(state: &AppState, path: &str) -> Result<String, ResolveError> {
     let sanitized = correct_url(path);
     let resolver = state.resolver.as_ref();
 
@@ -315,19 +429,19 @@ pub async fn resolve_id(state: &AppState, path: &str) -> Result<String, PageErro
     // the domain check at all. `path` here is the URL with its origin stripped
     // (`handlers/main.py:34`), so for `/medium.com/foo` it is the schemeless
     // `medium.com/foo` and this is the branch that fires.
-    let attempt: Result<String, PageError> = if !is_valid_url(path) {
+    let attempt: Result<String, ResolveError> = if !is_valid_url(path) {
         // `InvalidURL` — handlers/post.py:73-77.
-        Err(PageError::new(MSG_INVALID_URL, 404))
+        Err(ResolveError::InvalidUrl)
     } else {
         match is_valid_medium_url(&sanitized, resolver).await {
             // `NotValidMediumURL` — 404, and quiet: handlers/post.py:87.
-            Err(NotValidMediumUrl) => Err(PageError::new(MSG_NOT_VALID_URL, 404).quiet()),
+            Err(NotValidMediumUrl) => Err(ResolveError::NotValidMediumUrl),
             // `InvalidURL` — handlers/post.py:73-77.
-            Ok(false) => Err(PageError::new(MSG_INVALID_URL, 404)),
+            Ok(false) => Err(ResolveError::InvalidUrl),
             Ok(true) => match resolve_medium_url(&sanitized, resolver).await {
                 Some(post_id) => Ok(post_id.as_str().to_string()),
                 // `InvalidMediumPostURL` — handlers/post.py:78-83.
-                None => Err(PageError::new(MSG_NO_ARTICLE, 404)),
+                None => Err(ResolveError::NoArticle),
             },
         }
     };
@@ -369,139 +483,154 @@ async fn render_article(
     })
 }
 
-/// `MediumParser.query` (`core.py:159-211`): Postgres `cache`, then GraphQL.
+/// The durable cache read: Postgres, and nothing else.
 ///
-/// Two legacy behaviours are deliberately not reproduced, both flagged in
-/// `medium-client`'s docs: the `retry=2` loop that raises
-/// `MediumPostQueryError` is [`PostSource`](medium_client::source::PostSource)'s
-/// own retry policy, and the `reason` string that loop builds has a bug that
-/// makes it always report `"Unknown"`. The *exception type* is the same, which
-/// is what the caller's status code depends on.
+/// **No network, no render, no template.** That is what makes it usable as a
+/// cheap first step for `/api/v1` — the metadata endpoints need no `Document`, and
+/// the miss rate-limiter has to know a miss happened *before* anything expensive
+/// is attempted.
 ///
-/// # A cache row that is not a payload is a miss, and that is *nearly* the legacy
+/// # A failing read is a miss, and that is why this is not a `Result`
 ///
-/// `core.py:172-197` does not trust the cache: it re-checks the shape of
-/// whatever came back (`:178-187`) and, when a check fails, sets `reason` and
-/// retries against the API. [`decode_cached`] applies those same checks to the
-/// row, so a bad row costs one Medium request rather than a blank page.
-///
-/// One case does not line up, and it is unreachable rather than subtle. `{}` is
-/// *falsy* in Python, so `query_get` discards it and refetches — same as here.
-/// `{"data": {}}` is *truthy*, so it survives `query_get` and reaches the `:186`
-/// check, which 404s it without a refetch. This refetches instead. Distinguishing
-/// the two would mean reproducing a truthiness accident for a row nothing
-/// writes: `push` only ever stores a payload that `validate` accepted.
-pub async fn query(state: &AppState, post_id: &str) -> Result<PostPayload, PageError> {
-    // A failing cache *read* is a miss, not a 404 — `get_post_data_from_cache`
-    // wraps the read in `try/except` and returns `None` on any exception
-    // (`core.py:119-127`), so a Postgres outage in the legacy sends the request
-    // to the API rather than failing it. Taking the error here would turn a
-    // database blip into a 404 for every post that was not already cached.
-    let cached = match state.postgres.pull(post_id).await {
+/// `get_post_data_from_cache` wraps the read in `try/except` and returns `None`
+/// on any exception (`core.py:119-127`), so a Postgres outage in the legacy sends
+/// the request to the API rather than failing it. Taking the error here would turn
+/// a database blip into a 404 for every post that was not already cached. Since
+/// there is no case in which this returns `Err`, it returns an `Option` — a
+/// `Result` whose error arm is unreachable is a comment pretending to be a type.
+pub async fn query_cached(state: &AppState, post_id: &str) -> Option<PostPayload> {
+    // A failing cache *read* is a miss, not a 404.
+    let raw = match state.postgres.pull(post_id).await {
         Ok(raw) => raw,
         Err(err) => {
             tracing::warn!(post_id, error = %err, "the cache read failed; treating it as a miss");
             None
         }
-    };
+    }?;
 
-    if let Some(raw) = cached {
-        match decode_cached(&raw) {
-            Ok(payload) => {
-                tracing::debug!("post query was found on cache");
-                return Ok(payload);
-            }
-            Err(err) => {
-                // The legacy's `post_data.json()` raises here and is caught by
-                // `_get_from_cache`'s `except Exception` (`core.py:124-127`),
-                // which returns `None` so the caller goes to the API. A bad
-                // cache row must not become a 404 for a post that exists.
-                tracing::warn!(post_id, error = %err, "the cached value is unusable; refetching");
-            }
+    match decode_cached(&raw) {
+        Ok(payload) => {
+            tracing::debug!("post query was found on cache");
+            Some(payload)
+        }
+        Err(err) => {
+            // The legacy's `post_data.json()` raises here and is caught by
+            // `_get_from_cache`'s `except Exception` (`core.py:124-127`), which
+            // returns `None` so the caller goes to the API. A bad cache row must
+            // not become a 404 for a post that exists.
+            tracing::warn!(post_id, error = %err, "the cached value is unusable; refetching");
+            None
         }
     }
+}
 
-    // Fase 4's interlock, and the single line that keeps a shadow instance off
-    // the network. Placed here — **after** the cache has been given its chance
-    // and **before** `fetch_post` — because it is a genuine miss that must
-    // decline: a post that is cached renders normally and is compared normally,
-    // which is where almost all of the evidence comes from.
-    //
-    // Why the shadow may not fetch: SPIKE-1's *pooled* gate is still open, so a
-    // fetching Rust instance would go out through the same WARP exit production
-    // serves from, and `RUST_REWRITE_PLAN` §2.7 is explicit that exhausting that
-    // exit takes the whole site down rather than just the shadow. Decision 2 of
-    // the Fase 4 plan, and the reason there is a decision to make at all.
-    //
-    // The cost, stated plainly: a post that is *not* cached cannot be compared,
-    // so a difference that only shows on an uncached post is invisible to this
-    // phase. That is a real blind spot, and it is the trade the pool's state
-    // forces. It is why `difftest gen-shadow-seed` exists — seeding the durable
-    // cache is what puts a corpus in front of the comparison at all.
+/// The shadow gate, the fetch, and the push. **The only path to the network in
+/// this crate**, and the only place that decides whether to take it.
+///
+/// # `source` is a parameter on purpose
+///
+/// The page route passes `state.source` — the one that may carry
+/// `MEDIUM_AUTH_COOKIES`. Every `/api/v1` route passes
+/// [`AnonymousSource`](medium_client::http::AnonymousSource), which cannot. Making
+/// the source an argument rather than reading `state.source` here means the choice
+/// is visible at each call site, where a reviewer can see it, instead of being
+/// made once in a helper that both paths share and neither one owns.
+///
+/// # The interlock, and why it is *here*
+///
+/// Placed **after** the cache has been given its chance and **before** the fetch,
+/// because it is a genuine miss that must decline: a post that is cached renders
+/// normally and is compared normally, which is where almost all of the evidence
+/// comes from.
+///
+/// Why the shadow may not fetch: SPIKE-1's *pooled* gate is still open, so a
+/// fetching Rust instance would go out through the same WARP exit production
+/// serves from, and `RUST_REWRITE_PLAN` §2.7 is explicit that exhausting that exit
+/// takes the whole site down rather than just the shadow. Decision 2 of the Fase 4
+/// plan, and the reason there is a decision to make at all.
+///
+/// The cost, stated plainly: a post that is *not* cached cannot be compared, so a
+/// difference that only shows on an uncached post is invisible to this phase. That
+/// is a real blind spot, and it is the trade the pool's state forces. It is why
+/// `difftest gen-shadow-seed` exists — seeding the durable cache is what puts a
+/// corpus in front of the comparison at all.
+pub async fn fetch_and_cache(
+    state: &AppState,
+    post_id: &str,
+    source: &dyn PostSource,
+) -> Result<PostPayload, FetchFailure> {
     if state.config.shadow_mode {
         tracing::debug!(
             post_id,
             "shadow instance: declining to fetch on a cache miss"
         );
-        return Err(PageError::declined(SHADOW_NO_FETCH));
+        return Err(FetchFailure::Declined);
     }
 
-    let value = state
-        .source
-        .fetch_post(post_id)
-        .await
-        .map_err(|err| fetch_error(post_id, err))?;
+    let value = source.fetch_post(post_id).await.map_err(|err| {
+        tracing::error!(post_id, error = %err, "could not fetch the post");
+        FetchFailure::Fetch(err)
+    })?;
 
-    // `core.py:206-208`: push to the durable cache only when the cache was not
-    // the source. A payload that came from Postgres is already there.
+    // `core.py:206-208`: push to the durable cache only when the cache was not the
+    // source. A payload that came from Postgres is already there.
     if let Err(err) = state.postgres.push(post_id, &value.to_string()).await {
         // Not fatal: the legacy's `self.cache.push` is outside the try, so a
-        // failing push would propagate — but that turns a served page into a
-        // 500 on a cache hiccup. Logged, and the page is served.
+        // failing push would propagate — but that turns a served page into a 500
+        // on a cache hiccup. Logged, and the page is served.
         tracing::warn!(post_id, error = %err, "could not push the payload to cache");
     }
 
-    // Unreachable: `fetch_post` promises a `validate`d payload, so this is an
-    // object carrying `data.post` and `serde` accepts it. Kept as the legacy's
-    // generic `except Exception` (`handlers/post.py:88`) rather than an
-    // `expect`, because a 500 is a better answer than a dropped connection if
-    // the promise is ever broken.
     PostPayload::from_value(value).map_err(|err| {
         tracing::error!(post_id, error = %err, "fetched payload is not a payload");
-        PageError::unspecified()
+        FetchFailure::NotAPayload(err.to_string())
     })
+}
+
+/// `MediumParser.query` (`core.py:159-211`), for the page routes: Postgres
+/// `cache`, then GraphQL.
+///
+/// The API does not call this. It needs the two halves separately — so that a
+/// cache miss can be counted before it spends an upstream request, and so that a
+/// failure can carry its cause — and `crate::api::posts` composes them itself.
+///
+/// Two legacy behaviours are deliberately not reproduced, both flagged in
+/// `medium-client`'s docs: the `retry=2` loop that raises `MediumPostQueryError`
+/// is [`PostSource`](medium_client::source::PostSource)'s own retry policy, and
+/// the `reason` string that loop builds has a bug that makes it always report
+/// `"Unknown"`. The *exception type* is the same, which is what the caller's
+/// status code depends on.
+pub async fn query(state: &AppState, post_id: &str) -> Result<PostPayload, PageError> {
+    if let Some(payload) = query_cached(state, post_id).await {
+        return Ok(payload);
+    }
+
+    fetch_and_cache(state, post_id, state.source.as_ref())
+        .await
+        .map_err(PageError::from)
 }
 
 /// The cached row as a payload, or why it is not one (`core.py:178-187`).
 ///
+/// `core.py:172-197` does not trust the cache: it re-checks the shape of
+/// whatever came back (`:178-187`) and, when a check fails, sets `reason` and
+/// retries against the API. This applies those same checks to the row, so a bad
+/// row costs one Medium request rather than a blank page.
+///
+/// One case does not line up, and it is unreachable rather than subtle. `{}` is
+/// *falsy* in Python, so `query_get` discards it and refetches — same as here.
+/// `{"data": {}}` is *truthy*, so it survives `query_get` and reaches the `:186`
+/// check, which 404s it without a refetch. [`query_cached`] refetches instead.
+/// Distinguishing the two would mean reproducing a truthiness accident for a row
+/// nothing writes: `push` only ever stores a payload that `validate` accepted.
+///
 /// Returns a `String` rather than an error type because every caller does the
 /// same thing with it — logs it and refetches — and the three sources (a decode
 /// failure, [`validate`], `serde`) have three unrelated error types.
-fn decode_cached(raw: &str) -> Result<PostPayload, String> {
+pub(crate) fn decode_cached(raw: &str) -> Result<PostPayload, String> {
     let value = decode_json(raw).map_err(|err| err.to_string())?;
     validate(&value).map_err(|err| err.to_string())?;
     PostPayload::from_value(value).map_err(|err| err.to_string())
-}
-
-/// A failed fetch → the 404 at `handlers/post.py:78-83`, for **every** variant.
-///
-/// # Why there is no 500 arm, against `handlers/post.py`'s four
-///
-/// The legacy maps six exception types onto its four branches, and
-/// `InvalidMediumPostID` — the only one that gets a 500
-/// (`handlers/post.py:84-85`) — is **never raised**. It is defined in
-/// `medium_parser_exceptions` and caught here, and that is the whole of its
-/// existence: nothing in `medium_parser` raises it. So a `FetchError` cannot be
-/// that, and the two failures the legacy's `query` can actually produce are
-/// `MediumPostQueryError` (`core.py:202`, when the retry loop gives up) and the
-/// `InvalidMediumPostURL` of a URL whose id does not resolve — both 404. The
-/// shape problem that looks like it should be a 500 is not: `validate` runs
-/// inside `fetch_post`, and its `NoPost`/`Malformed`/`GraphQl` variants are
-/// exactly what the legacy's `reason` checks turn into a retry and then a
-/// `MediumPostQueryError`.
-fn fetch_error(post_id: &str, error: FetchError) -> PageError {
-    tracing::error!(post_id, error = %error, "could not fetch the post");
-    PageError::new(MSG_NO_ARTICLE, 404)
 }
 
 /// `config.HOST_ADDRESS` + `config.ENABLE_ADS_BANNER`.
@@ -519,6 +648,7 @@ mod tests {
 
     use crate::error::{DECLINED_MESSAGE, DECLINED_STATUS, SHADOW_HEADER};
     use crate::state::tests::{FixedSource, RecordingSource, shadow_state, stub_state};
+    use medium_client::error::TransportError;
 
     fn correlation() -> Correlation {
         Correlation::new(
@@ -683,11 +813,18 @@ mod tests {
 
         // A URL under a domain that is neither known nor bad, with no post id in
         // it: `is_valid_medium_url` falls back to the resolve, which fails.
+        //
+        // The variant *and* the page it converts to. The variant is what
+        // `/api/v1/resolve` reads (it answers 400 here, not 404); the conversion
+        // is what the page renders, and it is the one under the difftest gate.
+        // Asserting only one of the two would leave the other free to drift.
         let error = resolve_id(&state, "https://example.com/x")
             .await
             .unwrap_err();
-        assert_eq!(error.status, 404);
-        assert_eq!(error.message.as_deref(), Some(MSG_INVALID_URL));
+        assert_eq!(error, ResolveError::InvalidUrl);
+        let page: PageError = error.into();
+        assert_eq!(page.status, 404);
+        assert_eq!(page.message.as_deref(), Some(MSG_INVALID_URL));
     }
 
     /// Fase 4's interlock, and the assertion the phase rests on: on a cache miss
@@ -777,5 +914,210 @@ mod tests {
         assert_eq!(response.status(), 404);
         assert!(response.headers().get(SHADOW_HEADER).is_none());
         assert!(recorder.0.lock().unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------------ //
+    // The typed errors `/api/v1` needs, and the promise that the page
+    // routes did not move when they arrived. Every assertion below is a
+    // byte of a page that is under the difftest gate.
+    // ------------------------------------------------------------------ //
+
+    /// A name per [`FetchError`] variant, for test messages.
+    ///
+    /// The `match` is **exhaustive**, and that is its job: it is what stops
+    /// [`every_fetch_error`]'s list from quietly falling behind the enum. A new
+    /// variant fails to compile here, so whoever adds one has to decide what the
+    /// page answers for it rather than discovering it in production.
+    fn fetch_error_name(error: &FetchError) -> &'static str {
+        match error {
+            FetchError::Transport(TransportError::Timeout) => "transport/timeout",
+            FetchError::Transport(TransportError::Proxy(_)) => "transport/proxy",
+            FetchError::Transport(TransportError::Other(_)) => "transport/other",
+            FetchError::Status { .. } => "status",
+            FetchError::NoPost => "no-post",
+            FetchError::Malformed(_) => "malformed",
+            FetchError::BadBody(_) => "bad-body",
+            FetchError::GraphQl(_) => "graphql",
+            FetchError::NoHealthyProxy => "no-healthy-proxy",
+        }
+    }
+
+    fn every_fetch_error() -> Vec<FetchError> {
+        vec![
+            FetchError::Transport(TransportError::Timeout),
+            FetchError::Transport(TransportError::Proxy("connection refused".to_string())),
+            FetchError::Transport(TransportError::Other("dns failure".to_string())),
+            FetchError::Status {
+                status: 403,
+                body: "Access denied".to_string(),
+            },
+            FetchError::NoPost,
+            FetchError::Malformed("not a JSON object".to_string()),
+            FetchError::BadBody("truncated".to_string()),
+            FetchError::GraphQl("no such post".to_string()),
+            FetchError::NoHealthyProxy,
+        ]
+    }
+
+    /// The page's half of the table: **every** fetch failure is the same 404.
+    ///
+    /// This is the test that has to stay green while `/api/v1` answers 502 and
+    /// 503 to four of these variants. Two tables over one typed error is the
+    /// only arrangement in which both can be right; if someone later "unifies"
+    /// them by having the API call this conversion, the API's error responses
+    /// change and the tests in `crate::api` fail — not this one, which is why
+    /// neither table is allowed to be derived from the other.
+    ///
+    /// The route-level half of the same claim is
+    /// [`an_instance_that_is_not_a_shadow_still_fetches`], which drives a real
+    /// transport failure (`RecordingSource`) through
+    /// [`render_medium_post_link`] and reads the 404 off the response.
+    #[test]
+    fn fetch_failure_becomes_a_404_for_the_page_route() {
+        let mut seen = Vec::new();
+
+        for error in every_fetch_error() {
+            seen.push(fetch_error_name(&error));
+            let page: PageError = FetchFailure::Fetch(error).into();
+
+            assert_eq!(page.status, 404, "{seen:?}");
+            assert_eq!(page.message.as_deref(), Some(MSG_NO_ARTICLE), "{seen:?}");
+            // Not quiet: a fetch that failed is worth an alert. The legacy's
+            // quiet paths are the mistyped URL and nothing else.
+            assert!(!page.quiet, "a failed fetch is worth an alert: {seen:?}");
+            // Not declined: this is a real answer, and the edge skips the marked
+            // ones. Marking it would take every failing post out of the
+            // comparison instead of surfacing it.
+            assert!(
+                page.declined.is_none(),
+                "only a decline carries the marker: {seen:?}"
+            );
+        }
+
+        assert_eq!(
+            seen.len(),
+            9,
+            "a variant was dropped from the list: {seen:?}"
+        );
+    }
+
+    /// The decline keeps its own status and its marker, and it is the one
+    /// `FetchFailure` that is not a 404. Fase 4's comparison depends on this
+    /// being distinguishable from a real failure.
+    #[test]
+    fn the_shadow_decline_keeps_its_own_status_and_marker() {
+        let page: PageError = FetchFailure::Declined.into();
+
+        assert_eq!(page.status, DECLINED_STATUS);
+        assert_eq!(page.declined, Some(SHADOW_NO_FETCH));
+    }
+
+    /// The unreachable variant, answered the way the legacy's generic
+    /// `except Exception` answers rather than by a dropped connection.
+    #[test]
+    fn a_payload_that_is_not_a_payload_is_a_500() {
+        let page: PageError = FetchFailure::NotAPayload("no data.post".to_string()).into();
+
+        assert_eq!(page.status, 500);
+        // `None` means the renderer picks from `ERROR_MSG_LIST`, which is what
+        // `generate_error()` does with no `error_msg`.
+        assert!(page.message.is_none());
+        assert!(page.declined.is_none());
+    }
+
+    /// `handlers/post.py:72-89`, one row per exception `resolve_id` can actually
+    /// produce.
+    ///
+    /// Three rows, not four: `InvalidMediumPostID` — the 500 at `:84-85` — is
+    /// never raised by `medium_parser`, so there is no [`ResolveError`] for it
+    /// and [`MSG_NO_POST_ID`] stays unreferenced. See its doc.
+    ///
+    /// `quiet` is a column because `NotValidMediumUrl` is the legacy's only
+    /// silenced path (`utils/error.py:39-40`): a mistyped URL is routine traffic
+    /// and does not reach Telegram, while the other two are alert-worthy.
+    #[test]
+    fn the_resolve_table_is_the_legacy_exception_table() {
+        let cases = [
+            (ResolveError::InvalidUrl, MSG_INVALID_URL, false),
+            (ResolveError::NotValidMediumUrl, MSG_NOT_VALID_URL, true),
+            (ResolveError::NoArticle, MSG_NO_ARTICLE, false),
+        ];
+
+        for (error, message, quiet) in cases {
+            let page: PageError = error.into();
+
+            assert_eq!(page.status, 404, "{error:?}");
+            assert_eq!(page.message.as_deref(), Some(message), "{error:?}");
+            assert_eq!(page.quiet, quiet, "{error:?}");
+            assert!(page.declined.is_none(), "{error:?}");
+        }
+    }
+
+    /// The table above is only load-bearing if the route goes through it, so this
+    /// drives a known-bad domain end to end and reads the message out of the
+    /// page.
+    ///
+    /// `github.com` is in `NOT_MEDIUM_DOMAINS`, which is the one branch that
+    /// raises `NotValidMediumUrl` (`resolve.rs:543`). Before this test nothing
+    /// asserted `MSG_NOT_VALID_URL` at all — the difftest fixtures happen not to
+    /// contain a known-bad domain, so the gate has no opinion on it either.
+    #[tokio::test]
+    async fn a_known_bad_domain_renders_the_legacy_message() {
+        let recorder = Arc::new(RecordingSource(Mutex::new(Vec::new())));
+        let state = stub_state(recorder.clone());
+
+        let response =
+            render_medium_post_link(&state, &correlation(), "https://github.com/x", true, true)
+                .await;
+
+        let status = response.status();
+        let html = body_text(response).await;
+
+        assert_eq!(status, 404);
+        assert!(html.contains(MSG_NOT_VALID_URL), "{html}");
+        assert!(
+            recorder.0.lock().unwrap().is_empty(),
+            "a known-bad domain is rejected before any fetch"
+        );
+    }
+
+    /// `fetch_and_cache` uses the source it is **handed**, not `state.source`.
+    ///
+    /// This is the seam `/api/v1` stands on: the API hands it the anonymous
+    /// source and the page hands it `state.source`. Passing a [`FixedSource`]
+    /// while the state's own source is a [`RecordingSource`] is what makes the
+    /// difference observable — if `fetch_and_cache` ever read the state instead,
+    /// the recorder would be non-empty and this would fail.
+    ///
+    /// The page's own side is covered by the two shadow tests above and by
+    /// [`an_instance_that_is_not_a_shadow_still_fetches`], all of which call
+    /// [`query`] and therefore this function with `state.source`.
+    #[tokio::test]
+    async fn fetch_and_cache_uses_the_source_it_is_given() {
+        let recorder = Arc::new(RecordingSource(Mutex::new(Vec::new())));
+        let state = stub_state(recorder.clone());
+
+        let payload = fetch_and_cache(&state, "0291df856c77", &FixedSource(payload()))
+            .await
+            .expect("the fixed source answers");
+
+        assert_eq!(payload.post().title, "A Test Article");
+        assert!(
+            recorder.0.lock().unwrap().is_empty(),
+            "the state's own source was reached, so the parameter is not what decides"
+        );
+    }
+
+    /// A cache read that fails is a **miss**, not an error: the stub's pool
+    /// points at `.invalid`, so this is the unreachable-database case.
+    ///
+    /// It is the reason [`query_cached`] returns an `Option` and not a `Result`,
+    /// and `/api/v1`'s miss bucket counts on it — a Postgres blip must not read
+    /// as "this id is not a post", nor as a request that never happened.
+    #[tokio::test]
+    async fn an_unreachable_cache_is_a_miss_not_an_error() {
+        let state = stub_state(Arc::new(RecordingSource(Mutex::new(Vec::new()))));
+
+        assert!(query_cached(&state, "0291df856c77").await.is_none());
     }
 }

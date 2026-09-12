@@ -158,6 +158,9 @@ pub async fn correlation(
     let started = Instant::now();
     let (id, code) = crate::transponder::generate();
     let url = request_url(&request);
+    // Captured before `next` consumes the request, and used only by the timeout
+    // branch below: `/api/*` gets a problem and everything else gets the page.
+    let uri = request.uri().clone();
 
     let correlation = Correlation::new(id, code, url);
     request.extensions_mut().insert(correlation.clone());
@@ -189,8 +192,28 @@ pub async fn correlation(
                 "request exceeded the {}s budget",
                 state.config.timeout.as_secs()
             );
-            crate::error::html_error(&state, &correlation, crate::error::PageError::unspecified())
+            // The API answers a problem, because a client that asked for JSON
+            // must not be handed a page — and because this branch runs on the
+            // *outer* router, where `crate::api::middleware` cannot reach it. The
+            // prefix is the whole of the discrimination, and it is the same one
+            // `.nest()` uses to mount the API.
+            if uri.path().starts_with("/api/") {
+                crate::api::problem::ApiError::new(
+                    freedium_dto::problem::ProblemKind::Timeout,
+                    format!(
+                        "the request exceeded the {}s budget",
+                        state.config.timeout.as_secs()
+                    ),
+                )
+                .resolve(&uri, Some(&correlation))
+            } else {
+                crate::error::html_error(
+                    &state,
+                    &correlation,
+                    crate::error::PageError::unspecified(),
+                )
                 .await
+            }
         }
     };
 
@@ -235,6 +258,36 @@ pub async fn catch_panics(State(state): State<AppState>, request: Request, next:
                 // load-bearing for correctness.
                 None => (StatusCode::INTERNAL_SERVER_ERROR, "An error occurred").into_response(),
             }
+        }
+    }
+}
+
+/// The API's version of [`catch_panics`].
+///
+/// Same job, different body: a panic on an `/api/v1` route has to answer a
+/// `problem+json` `500`, because the client asked for a machine-readable
+/// response and the page renderer would hand it HTML whose every escaping rule
+/// belongs to a document it never asked for.
+///
+/// It does not need the state — the problem is a constant — and it takes the URI
+/// through [`crate::api::request_uri`] because it runs *inside* `.nest("/api/v1")`,
+/// where the request's own `Uri` no longer carries the prefix.
+pub async fn catch_panics_json(request: Request, next: Next) -> Response {
+    let uri = crate::api::request_uri(&request);
+    let correlation = request.extensions().get::<Correlation>().cloned();
+
+    let outcome = AssertUnwindSafe(next.run(request)).catch_unwind().await;
+
+    match outcome {
+        Ok(response) => response,
+        Err(panic) => {
+            let detail = panic_message(&panic);
+            tracing::error!(%detail, "api handler panicked");
+            crate::api::problem::ApiError::new(
+                freedium_dto::problem::ProblemKind::Internal,
+                "an unexpected error occurred",
+            )
+            .resolve(&uri, correlation.as_ref())
         }
     }
 }
