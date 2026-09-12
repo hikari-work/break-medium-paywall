@@ -1,0 +1,28 @@
+{
+  "name": "headings",
+  "note": "H2/H3/H4 with and without preceding content: the first emitted heading gets no padding, then pt-12 for H2/H3 and pt-8 for H4 (core.py:324-362).",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [{ "displayTitle": "Rust" }],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "H2", "text": "First Heading", "name": "h2a", "layout": "", "markups": [] },
+              { "type": "P", "text": "Body one.", "name": "p1", "layout": "", "markups": [] },
+              { "type": "H3", "text": "Second Heading", "name": "h3a", "layout": "", "markups": [] },
+              { "type": "H4", "text": "Third Heading", "name": "h4a", "layout": "", "markups": [] },
+              { "type": "P", "text": "Body two.", "name": "p2", "layout": "", "markups": [] },
+              { "type": "H4", "text": "Fourth Heading", "name": "h4b", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

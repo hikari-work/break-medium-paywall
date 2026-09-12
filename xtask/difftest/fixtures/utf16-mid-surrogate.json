@@ -1,0 +1,32 @@
+{
+  "name": "utf16-mid-surrogate",
+  "note": "The one place the rewrite deliberately prints different bytes from the legacy. A markup endpoint landing on the *second* unit of a surrogate pair makes the legacy leave its bang char behind and delete it by index after the splice has shifted everything along, so it emits malformed HTML with the first character of the spliced tag eaten. All three paragraphs below have such an endpoint, and the corruption differs by which endpoint it is — the closing tag's `<` for the first two, the opening tag's `<` for the third. crates/medium-doc/src/utf16.rs carries the measured table this was taken from.",
+  "expected_divergence": "The legacy corrupts its output whenever a markup endpoint lands on the second unit of a surrogate pair, at the start or at the end alike. This is one of the render bugs the rewrite exists to remove, so the IR snaps to the character boundary and the two sides are expected to differ. Declared here so the gate reports it as known, and so the declaration fails loudly if the divergence ever stops happening — a stale allowance is worse than none.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "hi 😀 there", "name": "x1", "layout": "", "markups": [
+                { "type": "STRONG", "start": 3, "end": 4 }
+              ] },
+              { "type": "P", "text": "hi 😀 there", "name": "x2", "layout": "", "markups": [
+                { "type": "STRONG", "start": 2, "end": 4 }
+              ] },
+              { "type": "P", "text": "hi 😀 there", "name": "x3", "layout": "", "markups": [
+                { "type": "STRONG", "start": 4, "end": 7 }
+              ] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

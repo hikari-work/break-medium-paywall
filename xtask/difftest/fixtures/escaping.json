@@ -1,0 +1,33 @@
+{
+  "name": "escaping",
+  "note": "Full escaping is `& < > \" '`; minimal is `& < >` alone (rl_string_helper/utils.py), and a single CODE markup anywhere in a paragraph forces minimal for the *whole* paragraph (core.py:232) — so paragraph two keeps its raw quotes and apostrophes. Two quirks are pinned here: `'` becomes `&#39` with no semicolon, and a value already shaped like an entity is skipped by the pattern's negative lookahead. A link href is interpolated inside a `{% raw %}` block and never escaped at all, so its `&` stays bare.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Tom & Jerry <b>bold</b> \"quoted\" isn't it? 5 > 3", "name": "e1", "layout": "", "markups": [] },
+              { "type": "P", "text": "Code & \"quotes\" and 'apostrophes' <here>", "name": "e2", "layout": "", "markups": [
+                { "type": "CODE", "start": 0, "end": 4 }
+              ] },
+              { "type": "PRE", "text": "if a & b: print(\"<hi>\")", "name": "e3", "layout": "", "markups": [],
+                "codeBlockMetadata": { "lang": "python", "mode": null } },
+              { "type": "P", "text": "An entity &amp; another &lt;tag&gt; and \"quotes\"", "name": "e4", "layout": "", "markups": [] },
+              { "type": "P", "text": "A query string link.", "name": "e5", "layout": "", "markups": [
+                { "type": "A", "anchorType": "LINK", "start": 2, "end": 14, "href": "https://example.com/?a=1&b=2", "rel": "noopener", "title": "q" }
+              ] },
+              { "type": "P", "text": "y'all can't stop", "name": "e6", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

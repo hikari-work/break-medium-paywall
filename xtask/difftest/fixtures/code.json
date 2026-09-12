@@ -1,0 +1,34 @@
+{
+  "name": "code",
+  "note": "PRE runs join into one block per run, the language comes from the first paragraph, a missing lang falls back to nohighlight, and a CODE markup anywhere in a paragraph forces minimal escaping for the whole paragraph (core.py:232).",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "PRE", "text": "fn main() {", "name": "c1", "layout": "", "markups": [],
+                "codeBlockMetadata": { "lang": "rust", "mode": null } },
+              { "type": "PRE", "text": "    println!(\"hi & bye\");", "name": "c2", "layout": "", "markups": [] },
+              { "type": "PRE", "text": "}", "name": "c3", "layout": "", "markups": [] },
+              { "type": "PRE", "text": "no lang here", "name": "c4", "layout": "", "markups": [],
+                "codeBlockMetadata": { "lang": null, "mode": null } },
+              { "type": "PRE", "text": "no metadata object", "name": "c5", "layout": "", "markups": [] },
+              { "type": "P", "text": "Inline code and a quote \"like this\" must keep the quotes.", "name": "p1", "layout": "",
+                "markups": [{ "type": "CODE", "start": 0, "end": 11 }] },
+              { "type": "P", "text": "A PRE paragraph with markup: foo and bar", "name": "c6", "layout": "",
+                "markups": [{ "type": "STRONG", "start": 29, "end": 32 }],
+                "codeBlockMetadata": { "lang": "python", "mode": null } }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

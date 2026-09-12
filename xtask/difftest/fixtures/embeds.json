@@ -1,0 +1,70 @@
+{
+  "name": "embeds",
+  "note": "MIXTAPE_EMBED slices its title and description straight out of `text` using markups[1] and markups[2] — markups[0] is ignored — so exactly three markups are required and anything else skips the paragraph with a warning (core.py:558-583). The site label comes from tld.get_fld, with a fallback to the bare hostname and then to a literal None when neither works.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Before the embeds.", "name": "p1", "layout": "", "markups": [] },
+              { "type": "MIXTURE_EMBED", "text": "blog.example.co.uk Example Article A deep dive into example things",
+                "name": "e1", "layout": "",
+                "mixtapeMetadata": { "href": "https://blog.example.co.uk/post", "thumbnailImageId": "thumb-a" },
+                "markups": [
+                  { "type": "A", "anchorType": "LINK", "start": 0, "end": 18, "href": "https://blog.example.co.uk" },
+                  { "type": "STRONG", "start": 19, "end": 34 },
+                  { "type": "EM", "start": 35, "end": 67 }
+                ] },
+              { "type": "MIXTURE_EMBED", "text": "example.com No protocol here At all",
+                "name": "e2", "layout": "",
+                "mixtapeMetadata": { "href": "example.com/no-protocol", "thumbnailImageId": "thumb-b" },
+                "markups": [
+                  { "type": "A", "anchorType": "LINK", "start": 0, "end": 11, "href": "https://example.com" },
+                  { "type": "STRONG", "start": 12, "end": 28 },
+                  { "type": "EM", "start": 29, "end": 35 }
+                ] },
+              { "type": "MIXTURE_EMBED", "text": "news.bbc.co.uk BBC News Top stories today",
+                "name": "e3", "layout": "",
+                "mixtapeMetadata": { "href": "https://news.bbc.co.uk/article", "thumbnailImageId": "thumb-c" },
+                "markups": [
+                  { "type": "A", "anchorType": "LINK", "start": 0, "end": 14, "href": "https://news.bbc.co.uk" },
+                  { "type": "STRONG", "start": 15, "end": 23 },
+                  { "type": "EM", "start": 24, "end": 41 }
+                ] },
+              { "type": "MIXTURE_EMBED", "text": "blog.example.co.uk Example Article A deep dive into example things",
+                "name": "e4", "layout": "",
+                "markups": [
+                  { "type": "A", "anchorType": "LINK", "start": 0, "end": 18, "href": "https://blog.example.co.uk" },
+                  { "type": "STRONG", "start": 19, "end": 34 },
+                  { "type": "EM", "start": 35, "end": 67 }
+                ] },
+              { "type": "MIXTURE_EMBED", "text": "blog.example.co.uk Example Article A deep dive into example things",
+                "name": "e5", "layout": "",
+                "mixtapeMetadata": { "href": "https://blog.example.co.uk/post", "thumbnailImageId": "thumb-d" },
+                "markups": [
+                  { "type": "A", "anchorType": "LINK", "start": 0, "end": 18, "href": "https://blog.example.co.uk" },
+                  { "type": "STRONG", "start": 19, "end": 34 }
+                ] },
+              { "type": "MIXTURE_EMBED", "text": "example.org Untitled A site without a thumbnail",
+                "name": "e6", "layout": "",
+                "mixtapeMetadata": { "href": "https://example.org/thing" },
+                "markups": [
+                  { "type": "A", "anchorType": "LINK", "start": 0, "end": 11, "href": "https://example.org" },
+                  { "type": "STRONG", "start": 12, "end": 20 },
+                  { "type": "EM", "start": 21, "end": 47 }
+                ] },
+              { "type": "P", "text": "After the embeds.", "name": "p2", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

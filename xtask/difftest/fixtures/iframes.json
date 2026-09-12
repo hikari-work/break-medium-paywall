@@ -1,0 +1,39 @@
+{
+  "name": "iframes",
+  "note": "IFRAME resolves its source in three steps — the local mediaResource, then a __ref into the payload's `data`, then a render_iframe/{id} fallback — and the ref is only followed when the local resource has neither an id nor an iframeSrc (core.py:604-690). Dimensions may live on the mediaResource or on the paragraph's iframe; having both means the ratio wrapper, missing them means the flat one.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "MediaResource:def456": { "id": "MediaResource:def456", "iframeSrc": "https://player.vimeo.com/video/123" },
+      "MediaResource:ghi789": { "id": "media-2" },
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Before the iframes.", "name": "p1", "layout": "", "markups": [] },
+              { "type": "IFRAME", "text": null, "name": "f1", "layout": "", "markups": [],
+                "iframe": { "mediaResource": { "iframeSrc": "https://www.youtube.com/embed/abc", "iframeWidth": 640, "iframeHeight": 360 } } },
+              { "type": "IFRAME", "text": null, "name": "f2", "layout": "", "markups": [],
+                "iframe": { "mediaResource": { "__ref": "MediaResource:def456" } } },
+              { "type": "IFRAME", "text": null, "name": "f3", "layout": "", "markups": [],
+                "iframe": { "mediaResource": { "__ref": "MediaResource:missing" } } },
+              { "type": "IFRAME", "text": null, "name": "f4", "layout": "", "markups": [],
+                "iframe": { "mediaResource": { "id": "media-1" } } },
+              { "type": "IFRAME", "text": null, "name": "f5", "layout": "", "markups": [],
+                "iframe": { "mediaResource": { "iframeSrc": "https://example.com/embed" }, "iframeWidth": 800, "iframeHeight": 450 } },
+              { "type": "IFRAME", "text": null, "name": "f6", "layout": "", "markups": [] },
+              { "type": "IFRAME", "text": null, "name": "f7", "layout": "", "markups": [],
+                "iframe": { "mediaResource": { "__ref": "MediaResource:ghi789" } } },
+              { "type": "P", "text": "After the iframes.", "name": "p2", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "name": "images",
+  "note": "IMG covers three alt spellings (a real string, an explicit null and a null metadata object — Jinja renders those as the string, `None` and the empty string), a caption that only exists when text does, an OUTSET_ROW run that swallows its OUTSET_ROW_CONTINUE neighbours and never emits their captions, and the FULL_WIDTH layout that is skipped with a warning. Note that an IMG *omitting* the metadata key cannot be tested here: the legacy reads it with paragraph[\"metadata\"] rather than .get at core.py:291, so an in-window IMG without it raises KeyError and kills the whole parse. The IR defaults it to None instead (§3.3), so that payload renders here but not in the legacy.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "IMG", "text": "A caption for the first image.", "name": "i1", "layout": "",
+                "markups": [], "metadata": { "id": "img-one", "alt": "A photo" } },
+              { "type": "IMG", "text": null, "name": "i2", "layout": "",
+                "markups": [], "metadata": { "id": "img-two", "alt": null } },
+              { "type": "IMG", "text": null, "name": "i3", "layout": "", "markups": [], "metadata": null },
+              { "type": "IMG", "text": "A caption for the row leader, which is never emitted.", "name": "r1", "layout": "OUTSET_ROW",
+                "markups": [], "metadata": { "id": "row-one", "alt": "Left" } },
+              { "type": "IMG", "text": "Also never emitted.", "name": "r2", "layout": "OUTSET_ROW_CONTINUE",
+                "markups": [], "metadata": { "id": "row-two", "alt": "Middle" } },
+              { "type": "IMG", "text": null, "name": "r3", "layout": "OUTSET_ROW_CONTINUE",
+                "markups": [], "metadata": { "id": "row-three", "alt": "Right" } },
+              { "type": "IMG", "text": "Back to a normal image after the row.", "name": "i4", "layout": "",
+                "markups": [], "metadata": { "id": "img-four", "alt": "After" } },
+              { "type": "IMG", "text": "Never rendered: FULL_WIDTH is unimplemented.", "name": "i5", "layout": "FULL_WIDTH",
+                "markups": [], "metadata": { "id": "img-five", "alt": "Full" } }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

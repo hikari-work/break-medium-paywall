@@ -1,0 +1,46 @@
+{
+  "name": "utf16",
+  "note": "Medium's offsets are UTF-16 code units, so every case here is one a byte-offset implementation gets wrong: an emoji covered whole ([3,5) on `hi 😀 there`), a range that starts just past a surrogate pair ([5,7), which selects the space and the letter after it), an end past the text (clamped), an empty range (skipped), and an accented character — one UTF-16 unit, two bytes — so that a byte-indexed map bolds the wrong run. Every endpoint here sits on a character boundary, which is what keeps this fixture free of the one declared divergence (utf16-mid-surrogate.json).",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "hi 😀 there", "name": "u1", "layout": "", "markups": [
+                { "type": "STRONG", "start": 3, "end": 5 }
+              ] },
+              { "type": "P", "text": "hi 😀 there", "name": "u2", "layout": "", "markups": [
+                { "type": "STRONG", "start": 5, "end": 7 }
+              ] },
+              { "type": "P", "text": "hi 😀 there", "name": "u3", "layout": "", "markups": [
+                { "type": "STRONG", "start": 3, "end": 20 }
+              ] },
+              { "type": "P", "text": "hi 😀 there", "name": "u4", "layout": "", "markups": [
+                { "type": "STRONG", "start": 3, "end": 3 },
+                { "type": "EM", "start": 5, "end": 7 }
+              ] },
+              { "type": "P", "text": "hi 😀 there", "name": "u5", "layout": "", "markups": [
+                { "type": "A", "anchorType": "LINK", "start": 3, "end": 5, "href": "https://example.com/emoji", "rel": "noopener", "title": "emoji" }
+              ] },
+              { "type": "P", "text": "café ☕ time", "name": "u6", "layout": "", "markups": [
+                { "type": "STRONG", "start": 0, "end": 4 },
+                { "type": "EM", "start": 5, "end": 6 }
+              ] },
+              { "type": "P", "text": "日本語 😀 テスト", "name": "u7", "layout": "", "markups": [
+                { "type": "STRONG", "start": 4, "end": 6 }
+              ] },
+              { "type": "H2", "text": "A heading with an emoji 🎉 in it", "name": "u8", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

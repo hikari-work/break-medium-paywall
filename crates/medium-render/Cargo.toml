@@ -1,0 +1,16 @@
+[package]
+name = "medium-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Document IR -> HTML. Phase 1 of the Rust rewrite."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+medium-doc = { path = "../medium-doc" }
+tracing = { workspace = true }
+
+[dev-dependencies]

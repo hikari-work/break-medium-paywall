@@ -1,0 +1,31 @@
+{
+  "name": "unknowns",
+  "note": "Tolerating the payload (RUST_REWRITE_PLAN.md §3.3): a paragraph type with no branch is reported and skipped rather than failing the article (core.py:678), a paragraph whose text is null is parsed as empty *and loses its markups* (core.py:298), a missing optional key defaults, and fields the query over-fetches — id, href, dropCapImage, validatedShareKey — are ignored. Paragraph five has no `layout` key and paragraph six has an empty (not null) text, which is a different branch and still emits an empty <p>, so both sides must agree on its classes. `markups` is always present, because the legacy reads it with [] rather than .get at core.py:238.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Before the unknowns.", "name": "z1", "layout": "", "markups": [] },
+              { "type": "TABLE", "text": "A table the renderer has no branch for.", "name": "z2", "layout": "", "markups": [] },
+              { "type": "", "text": "An empty type is unknown too.", "name": "z3", "layout": "", "markups": [] },
+              { "type": "P", "text": null, "name": "z4", "layout": "",
+                "markups": [{ "type": "STRONG", "start": 0, "end": 5 }],
+                "id": "over-fetched", "validatedShareKey": "xyz", "dropCapImage": { "id": "nope" } },
+              { "type": "P", "text": "No layout key at all.", "name": "z5", "markups": [] },
+              { "type": "P", "text": "", "name": "z6", "layout": "", "markups": [] },
+              { "type": "P", "text": "After the unknowns.", "name": "z7", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

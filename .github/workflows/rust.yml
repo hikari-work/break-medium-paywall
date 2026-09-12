@@ -1,11 +1,11 @@
 # CI for the Rust rewrite (RUST_REWRITE_PLAN §5, Fase 0: "setup workspace cargo + CI").
 #
-# NOTE ON HOSTING: the origin remote is codeberg.org, which does not read
-# `.github/workflows/`. Nothing here runs there as-is. This file is written in
-# GitHub Actions syntax so it works if the repo is mirrored to GitHub; to run it
-# on Codeberg, copy it verbatim to `.forgejo/workflows/rust.yml` — Forgejo
-# Actions is syntax-compatible and needs no edits beyond the `uses:` refs it
-# cannot resolve. It is left inert rather than half-ported.
+# HOSTING: `origin` is github.com:hikari-work/break-medium-paywall, so this file
+# is live — the earlier note claiming origin was Codeberg and the workflow inert
+# was written before the remote moved, and was wrong from that point on. The
+# rewrite happens on `rust/*` branches while `main` stays frozen at the Python
+# baseline (75d1433), so `rust/**` is listed under `push` as well: a gate that
+# only runs on a branch nobody pushes to is not a gate.
 #
 # The Python jobs are deliberately absent: this workflow covers only the Rust
 # workspace. `legacy/medium-parser/` keeps its own toolchain story for now.
@@ -14,7 +14,7 @@ name: rust
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'rust/**']
   pull_request:
 
 # A newer push to the same ref makes the in-flight run obsolete.
@@ -99,3 +99,65 @@ jobs:
           ./target/release/difftest run-difflib \
             --cases "${RUNNER_TEMP}/cases.jsonl" \
             --reference "${RUNNER_TEMP}/ref.jsonl"
+
+  # Fase 1 (§4): medium-doc + medium-render must produce the same HTML as the
+  # legacy renderer, compared in the canonical form rather than by tree shape —
+  # see xtask/difftest/src/canonical.rs for what that does and does not forgive.
+  #
+  # The reference here is the **real** legacy code, imported out of `legacy/`
+  # with its outside world stubbed (xtask/difftest/py/stubs.py). Nothing is
+  # copied, so this job cannot drift from the implementation it is measuring.
+  render-parity:
+    name: Fase 1 render parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Production runs python:3.12 with Jinja2==3.1.2
+      # (legacy/medium-parser/requirements.txt:9). The reference output depends
+      # on both: Jinja's `Undefined` is what turns a missing `alt` into the empty
+      # string and a null one into `None`, so an unpinned Jinja could change the
+      # baseline itself rather than the thing being measured.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the reference's only dependency
+        run: pip install Jinja2==3.1.2
+
+      - name: Build harness
+        run: cargo build --release -p difftest
+
+      - name: Generate corpus
+        run: |
+          ./target/release/difftest gen-render-cases \
+            --out "${RUNNER_TEMP}/render-cases.jsonl"
+
+      # Same reasoning as the difflib job: a gate is only reproducible if its
+      # corpus is, and fixtures are read in file-name order precisely so that
+      # this holds.
+      - name: Corpus must be deterministic
+        run: |
+          ./target/release/difftest gen-render-cases \
+            --out "${RUNNER_TEMP}/render-cases-again.jsonl"
+          cmp "${RUNNER_TEMP}/render-cases.jsonl" "${RUNNER_TEMP}/render-cases-again.jsonl"
+          echo "corpus is byte-identical across runs"
+
+      - name: Render with the legacy implementation
+        run: |
+          python3 xtask/difftest/py/render_ref.py \
+            --cases "${RUNNER_TEMP}/render-cases.jsonl" \
+            --out "${RUNNER_TEMP}/render-ref.jsonl"
+
+      # Non-zero on an undeclared difference, on a `expected_divergence`
+      # declaration that no longer diverges, on a fixture the legacy renderer
+      # could not render at all, and on a corpus too thin to have caught a
+      # broken port.
+      - name: Compare
+        run: |
+          ./target/release/difftest run-render \
+            --cases "${RUNNER_TEMP}/render-cases.jsonl" \
+            --reference "${RUNNER_TEMP}/render-ref.jsonl"

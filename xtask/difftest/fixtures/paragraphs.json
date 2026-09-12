@@ -1,0 +1,27 @@
+{
+  "name": "paragraphs",
+  "note": "P with a drop cap, mt-3 after a heading and mt-7 after anything else, plus the wrap-around read at core.py:415 where the *first* paragraph takes its margin from the last source paragraph.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "First, whose margin reads the H3 at the end of the article.", "name": "p1", "layout": "", "markups": [] },
+              { "type": "P", "text": "Second, after a P, so mt-7.", "name": "p2", "layout": "", "markups": [] },
+              { "type": "H3", "text": "Interlude", "name": "h3a", "layout": "", "markups": [] },
+              { "type": "P", "text": "Third, after a heading, so mt-3.", "name": "p3", "layout": "", "markups": [] },
+              { "type": "P", "text": "Fourth, with a drop cap.", "name": "p4", "layout": "", "markups": [], "hasDropCap": true }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -24,9 +24,11 @@
 //! later phase; it needs a corpus dumped from the production `cache` table,
 //! which is not available in this working tree.
 
+mod canonical;
 mod cases;
 mod impersonate;
 mod prng;
+mod render;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -37,6 +39,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use cases::Case;
+
+/// Where `gen-render-cases` looks when `--fixtures` is not given, relative to the
+/// workspace root — which is where `cargo run` puts the working directory.
+const DEFAULT_FIXTURES_DIR: &str = "xtask/difftest/fixtures";
 
 /// One line of the Python reference output.
 ///
@@ -70,6 +76,8 @@ fn main() -> ExitCode {
     match command.as_str() {
         "gen-cases" => cmd_gen_cases(&opts),
         "run-difflib" => cmd_run_difflib(&opts),
+        "gen-render-cases" => cmd_gen_render_cases(&opts),
+        "run-render" => cmd_run_render(&opts),
         "spike-impersonate-report" => cmd_spike_impersonate_report(&opts),
         "help" | "-h" | "--help" => {
             usage();
@@ -97,6 +105,17 @@ Commands:
       Compare the Rust port against the Python reference.
       Exits non-zero on any difference in ratio bits or in the boolean
       decision at the `> 80` threshold.
+
+  gen-render-cases  --out <path> [--fixtures <dir>]
+      Write the hand-written render fixtures as JSONL, ordered by file name.
+      --fixtures defaults to `xtask/difftest/fixtures`.
+
+  run-render  --cases <path> --reference <path> [--show <n>]
+      Render every fixture with medium-doc + medium-render and compare
+      against the legacy renderer, after both sides are reduced to the
+      canonical form. Exits non-zero on an undeclared difference, on a
+      declared difference that no longer happens, or on a corpus too thin
+      to prove anything (see the degeneracy report).
 
   spike-impersonate-report  --baseline <path> --candidate <path>
                             [--threshold <f>] [--show-proxies]
@@ -196,6 +215,68 @@ fn cmd_gen_cases(opts: &Options) -> ExitCode {
     }
     println!("longest sequence: {max_chars} code points");
     ExitCode::SUCCESS
+}
+
+fn cmd_gen_render_cases(opts: &Options) -> ExitCode {
+    let Some(out) = opts.get("out") else {
+        eprintln!("error: gen-render-cases requires --out <path>");
+        return ExitCode::FAILURE;
+    };
+    let dir = opts.get("fixtures").unwrap_or(DEFAULT_FIXTURES_DIR);
+
+    let fixtures = match render::load_fixtures(dir) {
+        Ok(fixtures) => fixtures,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Err(err) = render::write_cases(&fixtures, out) {
+        eprintln!("error: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    let declared = fixtures
+        .iter()
+        .filter(|fixture| fixture.expected_divergence.is_some())
+        .count();
+    println!("wrote {} cases to {out}", fixtures.len());
+    for fixture in &fixtures {
+        let marker = if fixture.expected_divergence.is_some() {
+            "  (difference declared)"
+        } else {
+            ""
+        };
+        println!("  {:<24}{marker}", fixture.name);
+    }
+    println!("{} fixture(s) declare an expected divergence", declared);
+    ExitCode::SUCCESS
+}
+
+fn cmd_run_render(opts: &Options) -> ExitCode {
+    let (Some(cases_path), Some(reference_path)) = (opts.get("cases"), opts.get("reference"))
+    else {
+        eprintln!("error: run-render requires --cases <path> and --reference <path>");
+        return ExitCode::FAILURE;
+    };
+    let show: usize = match opts.get("show").map(str::parse) {
+        Some(Ok(show)) => show,
+        Some(Err(err)) => {
+            eprintln!("error: --show: {err}");
+            return ExitCode::FAILURE;
+        }
+        None => 5,
+    };
+
+    match render::run(cases_path, reference_path, show) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_run_difflib(opts: &Options) -> ExitCode {

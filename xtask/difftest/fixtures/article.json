@@ -1,0 +1,69 @@
+{
+  "name": "article",
+  "note": "One article that touches every branch at once, in an order that exercises the interactions rather than the branches individually: headings that must not be mistaken for the title, a two-pass problem statement, an ordered pair of paragraph margins (mt-3 after a heading, mt-7 after anything else), a list run, a code run, a row of images, an iframe, an embed, an emoji, and escaping. Nothing here is dropped — no paragraph repeats the title, the subtitle or the preview image — so the whole fixture is a direct comparison of every template the renderer has.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "Rewriting Freedium's Parser",
+        "previewContent": { "subtitle": "A story about rewriting a parser" },
+        "previewImage": { "id": "preview", "alt": "Preview" },
+        "highlights": [],
+        "tags": [{ "displayTitle": "Rust" }],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "An introduction to the rewrite.", "name": "a01", "layout": "", "markups": [] },
+              { "type": "P", "text": "A parser that stitches strings.", "name": "a02", "layout": "", "markups": [
+                { "type": "EM", "start": 14, "end": 22 }
+              ] },
+              { "type": "H2", "text": "The problem", "name": "a03", "layout": "", "markups": [] },
+              { "type": "P", "text": "Two passes.", "name": "a04", "layout": "", "markups": [] },
+              { "type": "P", "text": "See the original issue.", "name": "a05", "layout": "", "markups": [
+                { "type": "A", "anchorType": "LINK", "start": 8, "end": 16, "href": "https://github.com/example/issues/1", "rel": "noopener", "title": "issue" }
+              ] },
+              { "type": "BQ", "text": "A quote about the matrix.", "name": "a06", "layout": "", "markups": [] },
+              { "type": "ULI", "text": "First point", "name": "a07", "layout": "", "markups": [] },
+              { "type": "ULI", "text": "Second point with a link", "name": "a08", "layout": "", "markups": [
+                { "type": "A", "anchorType": "LINK", "start": 20, "end": 24, "href": "https://example.com/l", "rel": "noopener", "title": "l" }
+              ] },
+              { "type": "ULI", "text": "Third point", "name": "a09", "layout": "", "markups": [] },
+              { "type": "H2", "text": "The plan", "name": "a10", "layout": "", "markups": [] },
+              { "type": "P", "text": "Inline code is minimal.", "name": "a11", "layout": "", "markups": [
+                { "type": "CODE", "start": 15, "end": 22 }
+              ] },
+              { "type": "PRE", "text": "fn render(&self) -> String {", "name": "a12", "layout": "", "markups": [],
+                "codeBlockMetadata": { "lang": "rust", "mode": null } },
+              { "type": "PRE", "text": "    todo!()", "name": "a13", "layout": "", "markups": [] },
+              { "type": "PQ", "text": "Simplicity wins.", "name": "a14", "layout": "", "markups": [] },
+              { "type": "IMG", "text": "The position matrix, drawn.", "name": "a15", "layout": "", "markups": [],
+                "metadata": { "id": "diagram", "alt": "A diagram" } },
+              { "type": "IMG", "text": null, "name": "a16", "layout": "OUTSET_ROW", "markups": [],
+                "metadata": { "id": "left", "alt": "Left" } },
+              { "type": "IMG", "text": null, "name": "a17", "layout": "OUTSET_ROW_CONTINUE", "markups": [],
+                "metadata": { "id": "right", "alt": "Right" } },
+              { "type": "H3", "text": "The details", "name": "a18", "layout": "", "markups": [] },
+              { "type": "P", "text": "Emoji offsets are UTF-16. 🎉", "name": "a19", "layout": "", "markups": [
+                { "type": "STRONG", "start": 26, "end": 28 }
+              ] },
+              { "type": "IFRAME", "text": null, "name": "a20", "layout": "", "markups": [],
+                "iframe": { "mediaResource": { "iframeSrc": "https://www.youtube.com/embed/xyz", "iframeWidth": 560, "iframeHeight": 315 } } },
+              { "type": "MIXTURE_EMBED", "text": "example.com Example Article Some description here",
+                "name": "a21", "layout": "",
+                "mixtapeMetadata": { "href": "https://example.com/post", "thumbnailImageId": "thumb" },
+                "markups": [
+                  { "type": "A", "anchorType": "LINK", "start": 0, "end": 11, "href": "https://example.com" },
+                  { "type": "STRONG", "start": 12, "end": 27 },
+                  { "type": "EM", "start": 28, "end": 49 }
+                ] },
+              { "type": "P", "text": "Ben & Jerry wrote this.", "name": "a22", "layout": "", "markups": [] },
+              { "type": "P", "text": "“Curly quotes” fold.", "name": "a23", "layout": "", "markups": [] },
+              { "type": "H4", "text": "Conclusion", "name": "a24", "layout": "", "markups": [] },
+              { "type": "P", "text": "That is the whole article.", "name": "a25", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

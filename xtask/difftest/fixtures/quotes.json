@@ -1,0 +1,28 @@
+{
+  "name": "quotes",
+  "note": "BQ and PQ wrap the rendered paragraph rather than building one, and curly quotes are folded to ASCII by quote_symbol before anything else runs (rl_string_helper/utils.py) — one character for one, so Medium's offsets stay valid across the fold.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "BQ", "text": "“The unexamined life is not worth living.” — Socrates", "name": "b1", "layout": "", "markups": [] },
+              { "type": "BQ", "text": "He said “hi” and left.", "name": "b2", "layout": "",
+                "markups": [{ "type": "EM", "start": 9, "end": 11 }] },
+              { "type": "PQ", "text": "Simplicity is the soul of efficiency.", "name": "q1", "layout": "",
+                "markups": [{ "type": "STRONG", "start": 18, "end": 22 }] },
+              { "type": "P", "text": "It’s a curly apostrophe, isn’t it?", "name": "p1", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "name": "lists",
+  "note": "A ULI run and an OLI run, each rebuilding its items without the highlight pass (core.py:423-476), plus the run breaking at the first paragraph of a different type.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [
+          {
+            "startOffset": 0,
+            "endOffset": 4,
+            "paragraphs": [{ "name": "u1", "text": "First item" }]
+          }
+        ],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "ULI", "text": "First item", "name": "u1", "layout": "", "markups": [] },
+              { "type": "ULI", "text": "Second item with a link", "name": "u2", "layout": "",
+                "markups": [{ "type": "A", "anchorType": "LINK", "start": 19, "end": 23,
+                              "href": "https://example.com/x", "rel": "noopener", "title": "x" }] },
+              { "type": "ULI", "text": "Third item with <angle> and & ampersand", "name": "u3", "layout": "", "markups": [] },
+              { "type": "P", "text": "Between the lists.", "name": "p1", "layout": "", "markups": [] },
+              { "type": "OLI", "text": "One", "name": "o1", "layout": "", "markups": [] },
+              { "type": "OLI", "text": "Two", "name": "o2", "layout": "", "markups": [] },
+              { "type": "OLI", "text": "Three", "name": "o3", "layout": "", "markups": [] },
+              { "type": "ULI", "text": "A list of one after the ordered list", "name": "u4", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

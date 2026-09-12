@@ -1,0 +1,42 @@
+{
+  "name": "markups-nested",
+  "note": "Overlapping and adjacent ranges. The legacy renderer splices templates with a position matrix, so a link cut in two by a strong comes out as *sibling* anchors while the IR nests them into one — measured legacy output is <a>ab</a><strong><a>cde</a></strong><a>fghij</a> for the first paragraph below. The canonical form exists so that difference is allowed, while a genuinely different annotation is not. Paragraph five repeats one markup twice, which nothing in the payload forbids.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "abcdefghij", "name": "n1", "layout": "", "markups": [
+                { "type": "A", "anchorType": "LINK", "start": 0, "end": 10, "href": "https://example.com/a", "rel": "noopener", "title": "a" },
+                { "type": "STRONG", "start": 2, "end": 5 }
+              ] },
+              { "type": "P", "text": "abcdefghij", "name": "n2", "layout": "", "markups": [
+                { "type": "STRONG", "start": 2, "end": 5 },
+                { "type": "A", "anchorType": "LINK", "start": 0, "end": 10, "href": "https://example.com/a", "rel": "noopener", "title": "a" }
+              ] },
+              { "type": "P", "text": "abcdefghij", "name": "n3", "layout": "", "markups": [
+                { "type": "A", "anchorType": "LINK", "start": 0, "end": 10, "href": "https://example.com/a", "rel": "noopener", "title": "a" },
+                { "type": "STRONG", "start": 0, "end": 10 }
+              ] },
+              { "type": "P", "text": "abcdefghij", "name": "n4", "layout": "", "markups": [
+                { "type": "A", "anchorType": "LINK", "start": 0, "end": 5, "href": "https://example.com/a", "rel": "noopener", "title": "a" },
+                { "type": "STRONG", "start": 5, "end": 10 }
+              ] },
+              { "type": "P", "text": "abcdefghij", "name": "n5", "layout": "", "markups": [
+                { "type": "STRONG", "start": 0, "end": 5 },
+                { "type": "STRONG", "start": 0, "end": 5 }
+              ] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

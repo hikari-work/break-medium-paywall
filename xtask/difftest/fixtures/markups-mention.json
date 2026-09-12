@@ -1,0 +1,41 @@
+{
+  "name": "markups-mention",
+  "note": "Every markup type markups.py knows: a LINK (target is blank unless the href is an in-page #anchor), a USER mention (a medium.com/u/ URL, and it ignores href entirely), STRONG, EM and CODE (whose class uses single quotes in the template). It also covers the two drop paths — an A with an anchorType that is neither LINK nor USER, and a markup type with no template. Deliberately absent: a LINK with no href key. The legacy reads it with markup[\"href\"] rather than .get, so it raises KeyError and kills the whole parse, while the IR defaults it to the empty string; a fixture for it would abort the reference rather than compare anything, and the GraphQL query fetches href as non-null, so the payload cannot produce it.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "Thanks to Ada Lovelace for the idea.", "name": "m1", "layout": "", "markups": [
+                { "type": "A", "anchorType": "USER", "start": 10, "end": 22, "userId": "abc123" }
+              ] },
+              { "type": "P", "text": "See the footnote at the end.", "name": "m2", "layout": "", "markups": [
+                { "type": "A", "anchorType": "LINK", "start": 8, "end": 16, "href": "#footnote1", "rel": "noopener", "title": "note" }
+              ] },
+              { "type": "P", "text": "Grace Hopper wrote COBOL.", "name": "m3", "layout": "", "markups": [
+                { "type": "A", "anchorType": "MENTION", "start": 0, "end": 12, "userId": "x" }
+              ] },
+              { "type": "P", "text": "Water is H2O.", "name": "m4", "layout": "", "markups": [
+                { "type": "SUBSCRIPT", "start": 9, "end": 12 }
+              ] },
+              { "type": "P", "text": "Call parse_markups to see.", "name": "m5", "layout": "", "markups": [
+                { "type": "CODE", "start": 5, "end": 18 }
+              ] },
+              { "type": "P", "text": "An emphasis and a strong word.", "name": "m6", "layout": "", "markups": [
+                { "type": "EM", "start": 3, "end": 11 },
+                { "type": "STRONG", "start": 18, "end": 24 }
+              ] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

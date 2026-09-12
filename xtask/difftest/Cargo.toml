@@ -11,5 +11,11 @@ workspace = true
 
 [dependencies]
 medium-doc = { path = "../../crates/medium-doc" }
+medium-render = { path = "../../crates/medium-render" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The render gate's normaliser. Both sides are canonicalised by this one
+# implementation, so it is a build dependency of the harness and not of any
+# crate that ships.
+html5ever = { workspace = true }
+markup5ever_rcdom = { workspace = true }

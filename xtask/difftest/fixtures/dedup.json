@@ -1,0 +1,29 @@
+{
+  "name": "dedup",
+  "note": "The four-paragraph window (current_pos in range(4), core.py:259) and everything it drops: an H3 repeating the title, an IMG repeating previewImage, an H4 equal to a tag, plus the truncated-subtitle rule that only *clears* the subtitle without dropping the paragraph. Paragraph five is the same H3 as paragraph two and is rendered, because the window has closed — that is the point of this fixture.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "The Title",
+        "previewContent": { "subtitle": "A long subtitle that was truncated…" },
+        "previewImage": { "id": "preview", "alt": "Preview" },
+        "highlights": [],
+        "tags": [{ "displayTitle": "Rust" }],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "This first paragraph is deliberately longer than one hundred characters so that the truncated-subtitle rule fires and clears the subtitle before anything else in the article renders at all.", "name": "d1", "layout": "", "markups": [] },
+              { "type": "H3", "text": "The Title", "name": "d2", "layout": "", "markups": [] },
+              { "type": "IMG", "text": null, "name": "d3", "layout": "", "markups": [],
+                "metadata": { "id": "preview", "alt": "The preview image repeats here" } },
+              { "type": "H4", "text": "Rust", "name": "d4", "layout": "", "markups": [] },
+              { "type": "H3", "text": "The Title", "name": "d5", "layout": "", "markups": [] },
+              { "type": "P", "text": "A closing paragraph.", "name": "d6", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

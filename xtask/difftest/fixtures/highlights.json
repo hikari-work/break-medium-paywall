@@ -1,0 +1,39 @@
+{
+  "name": "highlights",
+  "note": "A reader highlight is applied only when the highlight's own text equals the paragraph's *rendered* text (core.py:309 compares against get_text(), not the raw payload text), so it lands on a plain paragraph and is dropped on anything the renderer touched. Paragraph three has no markup at all and still fails, because escaping turned its `&` into `&amp;` — the quirk that makes highlights rare in practice, pinned here rather than fixed.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "An Article",
+        "previewContent": { "subtitle": "A subtitle" },
+        "previewImage": { "id": "preview" },
+        "tags": [],
+        "highlights": [
+          { "startOffset": 2, "endOffset": 7,
+            "paragraphs": [{ "name": "h1", "text": "A plain sentence to highlight." }] },
+          { "startOffset": 2, "endOffset": 6,
+            "paragraphs": [{ "name": "h2", "text": "A bold word here." }] },
+          { "startOffset": 0, "endOffset": 3,
+            "paragraphs": [{ "name": "h3", "text": "Ben & Jerry are here." }] },
+          { "startOffset": 0, "endOffset": 11,
+            "paragraphs": [{ "name": "does-not-exist", "text": "Nothing matches this." }] },
+          { "startOffset": 0, "endOffset": 18,
+            "paragraphs": [{ "name": "h4", "text": "The whole paragraph" }] }
+        ],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "P", "text": "A plain sentence to highlight.", "name": "h1", "layout": "", "markups": [] },
+              { "type": "P", "text": "A bold word here.", "name": "h2", "layout": "", "markups": [
+                { "type": "STRONG", "start": 2, "end": 6 }
+              ] },
+              { "type": "P", "text": "Ben & Jerry are here.", "name": "h3", "layout": "", "markups": [] },
+              { "type": "P", "text": "The whole paragraph", "name": "h4", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

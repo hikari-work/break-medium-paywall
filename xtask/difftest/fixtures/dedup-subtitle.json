@@ -1,0 +1,25 @@
+{
+  "name": "dedup-subtitle",
+  "note": "Both de-duplication rules *rewrite* the metadata as a side effect, and the rewrite is what the gate has to see: a heading matching an ellipsised title replaces the title (core.py:261-263), and a paragraph matching a complete subtitle replaces the subtitle (core.py:277-279). Here the replacement differs from the original by one character in each case, so a port that drops the paragraph without performing the rewrite fails.",
+  "host_address": "https://freedium.test",
+  "post_data": {
+    "data": {
+      "post": {
+        "title": "A truncated title with an ellipsis…",
+        "previewContent": { "subtitle": "A complete subtitle" },
+        "previewImage": { "id": "preview" },
+        "highlights": [],
+        "tags": [],
+        "content": {
+          "bodyModel": {
+            "paragraphs": [
+              { "type": "H3", "text": "A truncated title with an ellipsis", "name": "s1", "layout": "", "markups": [] },
+              { "type": "P", "text": "A complete subtitle.", "name": "s2", "layout": "", "markups": [] },
+              { "type": "P", "text": "Visible body text that stays.", "name": "s3", "layout": "", "markups": [] }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
