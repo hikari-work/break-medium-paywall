@@ -9,22 +9,27 @@
 #     docker build -f crates/freedium-web/Dockerfile -t freedium-web .
 #
 # The file lives here rather than beside the root `Dockerfile` because that one
-# is the *Python* server, which is still what production runs until Fase 5. This
-# file does not touch it, and until Fase 4 adds the compose service nothing
-# consumes this image — so it is built and smoke-run by hand, not in CI.
+# is the *Python* server. The Python path was never deployed — the Rust rewrite
+# replaced it first — so this is the image production runs, and it is the one
+# `.github/workflows/images.yml` publishes to `ghcr.io/hikari-work/freedium-web`
+# on every push. It was built and smoke-run by hand until Fase 5 gave it a
+# workflow of its own.
 #
 # # The compose healthcheck has to change when this image is used
 #
 # `docker-compose/docker-compose.main.yml:29` runs
 # `CMD-SHELL curl -f http://localhost:7080/ ...`. That cannot work here: the
 # runtime stage is distroless, so there is no shell for `CMD-SHELL` to hand the
-# string to and no `curl` to run even if there were. Switch it to
+# string to and no `curl` to run even if there were. It has to be
 #
 #     test: ["CMD", "/app/freedium-web", "healthcheck"]
 #
 # which is what `src/main.rs`'s `healthcheck` subcommand exists for, and which
-# sends the same request the current line does (same `User-Agent`, same 80 s
-# `--max-time`). Getting this wrong is not a cosmetic failure: a `CMD-SHELL`
+# sends the same request the Python line does (same `User-Agent`, same 80 s
+# `--max-time`). Both services that actually run this image
+# (`freedium_web_rust` in `main.yml` and `docker-compose.vps.yml`) already use
+# the `CMD` form; the `CMD-SHELL` line above belongs to the Python anchor and
+# stays there. Getting this wrong is not a cosmetic failure: a `CMD-SHELL`
 # healthcheck in a shell-less image always fails, and `freedium_autoheal`
 # (`AUTOHEAL_CONTAINER_LABEL=all`) would then restart a perfectly healthy
 # container in a loop.
