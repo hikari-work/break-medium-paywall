@@ -1,0 +1,67 @@
+[package]
+name = "freedium-bot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Bot Telegram: artikel Medium sebagai rich message. Fase 7 dari Rust rewrite."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Kontrak publik `/api/v1`, dipakai apa adanya. **Fitur `openapi` sengaja tidak
+# dinyalakan** — itu yang dilakukan `freedium-web` (satu-satunya yang menyajikan
+# spec), sementara bot tidak pernah menyajikan apa pun. Mendefinisikan ulang
+# `PostDto`/`BlockDto` di sini justru drift yang crate itu ada untuk mencegah.
+freedium-dto = { version = "0.1.0", path = "../freedium-dto" }
+
+# **Hanya untuk satu fungsi**, dan itu disengaja:
+# `medium_doc::metadata::human_readable_date`. Tanggal di byline pesan harus
+# sama persis dengan tanggal di halaman, dan halaman memakai fungsi itu. Menyalin
+# lima belas baris aritmetika kalender ke sini akan menghasilkan implementasi
+# kedua yang bisa berbeda diam-diam — persis yang bot ini ada untuk mencegah.
+#
+# Ini tidak melanggar aturan "bot adalah klien tipis". Yang dihindari bot adalah
+# **ketergantungan boot** `freedium-cache`/`medium-client` (Postgres dan Redis),
+# bukan pustaka murni: `medium-doc` hanya serde, regex, `url`, dan `psl`, tidak
+# menyentuh jaringan maupun basis data. Ia juga sudah ada di graf dependensi ini
+# lewat `medium-client`, jadi menautkannya tidak menambah satu pun kompilasi.
+medium-doc = { version = "0.1.0", path = "../medium-doc" }
+
+# Seam `Transport` — satu-satunya jalan keluar jaringan yang dikenal workspace
+# ini. `notify.rs` mengirim Telegram lewat trait yang sama dan alasannya sama:
+# `medium-client` adalah satu-satunya crate yang menyentuh jaringan, dan sebuah
+# trait membuat "apa yang akan dikirim" bisa diuji tanpa soket.
+#
+# **`default-features = false` mematikan transport yang mengimpersonasi, dan
+# karena itu BoringSSL.** Bot tidak pernah memanggil `medium.com` — ia memanggil
+# API kita sendiri lewat Cloudflare dan `api.telegram.org`, keduanya menerima
+# `reqwest`. Yang dibeli: `cargo build -p freedium-bot` tidak butuh cmake,
+# libclang, atau perl. Catatan pentingnya: build `--workspace` tetap menyatukan
+# fitur dan mengompilasi BoringSSL sekali, karena `freedium-web` menyalakannya.
+# Ini menghemat build bot saja, bukan build image.
+medium-client = { version = "0.1.0", path = "../medium-client", default-features = false }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "signal",
+] }
+tracing.workspace = true
+# `env-filter` bukan fitur default, dan dukungan `RUST_LOG` membutuhkannya.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# `?url=` dan query `getUpdates` di-encode dengan ini. `notify.rs` memakainya
+# untuk alasan yang sama: encoder buatan sendiri salah pada `:` dan `/`.
+form_urlencoded.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Hanya untuk **mengimplementasikan** `Transport` di test. Trait-nya dideklarasikan
+# dengan `#[async_trait]`, jadi implementasinya harus memakai makro yang sama —
+# tanpa ini, satu-satunya transport yang bisa dipakai test adalah yang asli, dan
+# test yang butuh soket bukan test.
+async-trait.workspace = true

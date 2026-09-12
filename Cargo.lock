@@ -747,6 +747,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "freedium-bot"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "form_urlencoded",
+ "freedium-dto",
+ "medium-client",
+ "medium-doc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "freedium-cache"
 version = "0.1.0"
 dependencies = [
