@@ -48,6 +48,7 @@
 //!   cukup; mengetik lalu mengedit berarti dua panggilan API untuk satu pesan,
 //!   dan Telegram membatasi laju per obrolan.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,19 +98,79 @@ const NOTICE_TITLE: &str = "Freedium";
 /// sebuah post — tidak ada post yang bisa ditunjuknya.
 const NOTICE_ID: &str = "tamu";
 
-/// Jatah foto yang dicoba berturut-turut untuk sebuah panggilan tamu.
+/// Bentuk balasan yang dicoba berturut-turut untuk sebuah panggilan tamu.
 ///
-/// Yang pertama tanpa batas: kalau Telegram menerimanya, tidak ada yang
-/// dikorbankan, dan itulah yang terjadi pada hampir semua artikel. Yang kedua
-/// menyisakan satu foto — gambar pratinjau di atas judul, yang membuat hasilnya
-/// masih terlihat seperti artikel. Yang terakhir membuang fotonya sama sekali,
-/// dan itu satu-satunya isi yang **diketahui** diterima: artikel satu foto
-/// (`a61157615501`) lolos, artikel tujuh foto (`9d0b88a1763b`) ditolak, dengan
-/// isi yang sama persis yang terkirim utuh di DM.
+/// # Kenapa harus bertahap, bukan sekali tebak
 ///
-/// Urutannya menurun dan berhenti di yang pertama berhasil, jadi artikel yang
-/// tidak bermasalah tidak pernah membayar satu pun percobaan tambahan.
-const GUEST_PHOTO_LADDER: [usize; 3] = [usize::MAX, 1, 0];
+/// Hasil inline menolak sebagian artikel bergambar dengan *"invalid inline
+/// message content specified"*, sementara isi yang sama persis terkirim utuh di
+/// DM. Yang membuatnya ditolak **belum bisa dipastikan dari sini**. Tangga ini
+/// yang mencarinya alih-alih sebuah angka yang ditebak di kode: ia menurunkan
+/// tuntutan sampai ada yang diterima, dan mencatat di mana berhentinya.
+///
+/// # Dua sebab yang sedang diuji, keduanya belum terbukti
+///
+/// 1. **Ukuran berkasnya.** `1b4e3bff6795` membawa PNG 867 KB dan 753 KB, dan
+///    ditolak; `a61157615501` membawa PNG 308 KB dan lolos sebagai tamu tiga
+///    kali. [`Attempt::SmallerPhotos`] yang menguji ini, dan ia sengaja dipilih
+///    sebagai tingkat kedua: kalau benar, fotonya **selamat**, cuma diperkecil.
+/// 2. **URL tanpa ekstensi.** `8083b8ac6e2c` satu-satunya artikel yang seluruh
+///    URL gambarnya berbentuk `0*<hash>` tanpa ekstensi, dan ia ditolak bahkan
+///    pada satu foto. Yang ini **tidak** bisa diuji dengan mengecilkan lebar:
+///    bentuk `0*` memang kanonik — menambahkan `.jpeg`/`.jpg`/`.png` ke situ
+///    `404`, sementara `fit:320` di depannya tetap `200`. Yang mengujinya cuma
+///    mengulang panggilan untuk artikel itu dan membaca tingkat mana yang lolos.
+///
+/// Kegagalan yang tidak dijelaskan keduanya: `9d0b88a1763b` ditolak dua kali
+/// lalu diterima dengan isi yang sama persis. Jadi setidaknya satu sebabnya
+/// **kadang-kadang**, bukan ambang yang tetap — jumlah foto menaikkan
+/// peluangnya, bukan melewati batas.
+///
+/// # Yang tidak diulang
+///
+/// Penolakan karena sebab lain. Mengurangi foto tidak akan memperbaiki
+/// `guest_query_id` yang basi atau token yang salah, dan mengulanginya cuma
+/// menambah permintaan gagal ke log — lihat [`Bot::answer_guest_reduced`].
+///
+/// Urutannya menurun dan berhenti di yang pertama diterima, jadi artikel yang
+/// tidak bermasalah tidak pernah membayar satu pun percobaan tambahan. Tingkat
+/// terakhir membuang foto sama sekali, dan itu satu-satunya bentuk yang
+/// **diketahui** selalu diterima.
+const GUEST_ATTEMPTS: [Attempt; 3] = [Attempt::Full, Attempt::SmallerPhotos, Attempt::NoPhotos];
+
+/// Satu tingkat di [`GUEST_ATTEMPTS`].
+///
+/// Dibuat enum alih-alih sekadar daftar jatah foto karena dua tingkat pertama
+/// memakai jatah yang sama — yang membedakannya lebar gambarnya, bukan
+/// jumlahnya — dan karena nilai yang dicatat ke log harus bisa dibaca operator.
+/// `usize::MAX` pernah tercetak sebagai `max_photos=18446744073709551615`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// Apa adanya. Ini yang dipakai jalur DM juga, dan satu-satunya tingkat
+    /// yang tidak mengorbankan apa pun.
+    Full,
+
+    /// Foto yang sama, diminta dalam lebar [`rich::SMALL_PHOTO_WIDTH`].
+    SmallerPhotos,
+
+    /// Tanpa foto sama sekali: teksnya utuh, gambarnya hilang.
+    NoPhotos,
+}
+
+impl Attempt {
+    /// Jatah foto tingkat ini; `None` berarti tidak dibatasi.
+    ///
+    /// `Attempt::Full` dan [`Attempt::SmallerPhotos`](Attempt::SmallerPhotos)
+    /// sama-sama tanpa batas — yang kedua mengecilkan, bukan membuang, dan
+    /// membuangnya di situ berarti mengorbankan foto sebelum Telegram sempat
+    /// menolaknya.
+    fn max_photos(self) -> Option<usize> {
+        match self {
+            Self::Full | Self::SmallerPhotos => None,
+            Self::NoPhotos => Some(0),
+        }
+    }
+}
 
 /// Balasan untuk `/start`, `/help`, dan pesan yang tidak memuat tautan.
 const HELP: &str = "\
@@ -405,38 +466,53 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
         self.answer_guest_reduced(query_id, &post_id, &post).await
     }
 
-    /// Menjawab panggilan tamu, menurunkan jatah fotonya sampai Telegram terima.
+    /// Menjawab panggilan tamu, meringankan bentuknya sampai Telegram menerima.
     ///
-    /// # Kenapa harus bertahap, bukan sekali tebak
+    /// Tingkatnya ada di [`GUEST_ATTEMPTS`], beserta alasan tiap tingkat dan
+    /// dugaan yang sedang diujinya. Yang perlu dijelaskan di sini cuma dua hal.
     ///
-    /// Hasil inline menolak artikel bergambar dengan *"invalid inline message
-    /// content specified"*, sementara isi yang sama persis terkirim utuh di DM.
-    /// Yang mana yang sebenarnya jadi pembatas belum bisa dipastikan dari sini —
-    /// jumlah medianya, satu media tertentu, atau sesuatu yang belum terpikir.
+    /// # Yang diulang cuma penolakan isi
     ///
-    /// Karena itu bot ini yang mencarinya, bukan sebuah angka yang ditebak di
-    /// kode: ia menurunkan jatahnya sampai ada yang diterima, dan mencatat di
-    /// mana berhentinya. Satu hari pemakaian sungguhan menjawab pertanyaan yang
-    /// tidak bisa dijawab oleh pembacaan dokumen.
+    /// [`Answered::ContentRejected`] spesifik: `400` pada `answerGuestQuery`.
+    /// Mengurangi foto tidak akan memperbaiki `guest_query_id` yang basi atau
+    /// token yang salah, jadi galat selain itu berhenti di percobaan pertama —
+    /// dua permintaan gagal yang tidak mungkin berhasil cuma menambah kebisingan
+    /// ke log dan menunda apa pun yang dilihat pengguna.
     ///
-    /// Yang **tidak** diulang: penolakan karena sebab lain. Mengurangi foto
-    /// tidak akan memperbaiki `guest_query_id` yang basi atau token yang salah,
-    /// dan mengulanginya cuma menambah dua permintaan gagal ke log.
+    /// Tingkat terakhir tidak diikuti apa-apa lagi. Kalau teks tanpa foto pun
+    /// ditolak, tidak ada bentuk yang lebih ringan yang tersisa, dan hasilnya
+    /// dilaporkan sebagai kegagalan biasa.
     async fn answer_guest_reduced(&self, query_id: &str, post_id: &str, post: &PostDto) {
-        for (nomor, max_photos) in GUEST_PHOTO_LADDER.iter().enumerate() {
-            let rendered = self.render_with_photos(post_id, post, *max_photos);
+        for (nomor, attempt) in GUEST_ATTEMPTS.iter().enumerate() {
+            let rendered = self.render_attempt(post_id, post, *attempt);
 
             match self
-                .answer_guest(query_id, post_id, &post.meta.title, rendered)
+                .answer_guest(query_id, post_id, &post.meta.title, &rendered)
                 .await
             {
-                Answered::Delivered | Answered::Failed => return,
-                Answered::ContentRejected => {
-                    if nomor + 1 < GUEST_PHOTO_LADDER.len() {
+                Answered::Delivered => {
+                    // Tingkat pertama tidak berarti apa-apa — hampir semua
+                    // artikel berhenti di situ. Tingkat sesudahnya menandai
+                    // artikel yang ditolak Telegram apa adanya, dan menyebut
+                    // bentuk mana yang akhirnya diterima: inilah jawaban yang
+                    // dicari tangga ini.
+                    if !matches!(attempt, Attempt::Full) {
                         tracing::warn!(
                             post_id,
-                            max_photos,
-                            "isi inline ditolak; mencoba lagi dengan lebih sedikit foto"
+                            attempt = ?attempt,
+                            "panggilan tamu diterima setelah diringankan"
+                        );
+                    }
+                    return;
+                }
+                Answered::Failed => return,
+                Answered::ContentRejected => {
+                    if nomor + 1 < GUEST_ATTEMPTS.len() {
+                        tracing::warn!(
+                            post_id,
+                            attempt = ?attempt,
+                            photos = rich::budget::Cost::of_blocks(&rendered.message.blocks).media,
+                            "isi inline ditolak; mencoba bentuk yang lebih ringan"
                         );
                     }
                 }
@@ -451,7 +527,12 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
     /// [`Bot::answer_guest`] sudah mencatat kegagalannya sendiri.
     async fn guest_notice(&self, query_id: &str, text: &str) {
         let _ = self
-            .answer_guest(query_id, NOTICE_ID, NOTICE_TITLE, rich::one_paragraph(text))
+            .answer_guest(
+                query_id,
+                NOTICE_ID,
+                NOTICE_TITLE,
+                &rich::one_paragraph(text),
+            )
             .await;
     }
 
@@ -460,7 +541,7 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
         self.render_with_photos(post_id, post, usize::MAX)
     }
 
-    /// [`Bot::render`] dengan jatah foto — lihat [`GUEST_PHOTO_LADDER`].
+    /// [`Bot::render`] dengan jatah foto — lihat [`crate::rich::rich_message_with_photos`].
     fn render_with_photos(
         &self,
         post_id: &str,
@@ -476,6 +557,22 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
         rendered
     }
 
+    /// [`Bot::render`] menurut satu tingkat [`GUEST_ATTEMPTS`].
+    ///
+    /// Yang dikecilkan cuma fotonya, dan cuma pada tingkat yang memang memintanya
+    /// — [`Attempt::Full`] tidak menyalin apa pun, supaya jalur yang sehat tetap
+    /// satu kali render dari DTO yang sama dengan jalur DM.
+    fn render_attempt(&self, post_id: &str, post: &PostDto, attempt: Attempt) -> rich::Rendered {
+        let post = match attempt {
+            Attempt::Full | Attempt::NoPhotos => Cow::Borrowed(post),
+            Attempt::SmallerPhotos => {
+                Cow::Owned(rich::with_smaller_photos(post, rich::SMALL_PHOTO_WIDTH))
+            }
+        };
+
+        self.render_with_photos(post_id, &post, attempt.max_photos().unwrap_or(usize::MAX))
+    }
+
     /// Mengirim satu hasil untuk sebuah panggilan tamu.
     ///
     /// Sekali coba, lalu sekali lagi kalau Telegram meminta menunggu — aturan
@@ -485,12 +582,16 @@ impl<A: Transport + 'static, T: Transport + 'static> Bot<A, T> {
     ///
     /// Yang dikembalikan membedakan **kenapa** gagal, karena pemanggilnya
     /// memperlakukan ketiganya berbeda — lihat [`Answered`].
+    ///
+    /// `rendered` dipinjam, bukan dimiliki, supaya pemanggilnya masih bisa
+    /// mencatat isi yang **ditolak** Telegram: yang dicari tangga ini justru
+    /// berapa foto yang ada di bentuk yang gagal itu.
     async fn answer_guest(
         &self,
         query_id: &str,
         post_id: &str,
         title: &str,
-        rendered: rich::Rendered,
+        rendered: &rich::Rendered,
     ) -> Answered {
         let result = telegram::guest_query_result(post_id, title, &rendered.message);
         let mut attempt = 0;
@@ -660,16 +761,57 @@ enum NotFound {
 /// Apa yang terjadi pada satu percobaan menjawab panggilan tamu.
 ///
 /// Tiga keadaan, bukan `bool`, karena pemanggilnya memperlakukan ketiganya
-/// berbeda: yang pertama berhenti, yang kedua menurunkan jatah foto, yang
-/// ketiga berhenti juga — dan menggabungkan dua yang terakhir jadi "gagal"
-/// berarti membuang foto tanpa alasan pada setiap galat jaringan.
+/// berbeda: yang pertama berhenti, yang kedua mencoba bentuk yang lebih ringan,
+/// yang ketiga berhenti juga — dan menggabungkan dua yang terakhir jadi "gagal"
+/// berarti mengorbankan foto tanpa alasan pada setiap galat jaringan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answered {
     /// Telegram menerimanya.
     Delivered,
-    /// Telegram menolak isinya. Jatah foto yang lebih kecil masih masuk akal
-    /// dicoba — lihat [`GUEST_PHOTO_LADDER`].
+    /// Telegram menolak isinya. Bentuk yang lebih ringan masih masuk akal
+    /// dicoba — lihat [`GUEST_ATTEMPTS`].
     ContentRejected,
     /// Galat lain. Mengubah isi tidak akan menolongnya.
     Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Attempt, GUEST_ATTEMPTS};
+
+    /// Tingkat terakhir membuang foto, dan tidak ada lagi sesudahnya.
+    ///
+    /// Itu satu-satunya bentuk yang **diketahui** selalu diterima, jadi ia harus
+    /// tetap ada dan tetap terakhir: kalau ia pindah ke depan, artikel yang
+    /// sebenarnya baik-baik saja kehilangan fotonya tanpa pernah dicoba apa
+    /// adanya.
+    #[test]
+    fn the_guest_ladder_is_faithful_first_and_drops_the_photos_last() {
+        assert_eq!(GUEST_ATTEMPTS.first(), Some(&Attempt::Full));
+        assert_eq!(GUEST_ATTEMPTS.last(), Some(&Attempt::NoPhotos));
+
+        let drops = GUEST_ATTEMPTS
+            .iter()
+            .position(|attempt| attempt.max_photos() == Some(0))
+            .expect("ada tingkat yang membuang foto, kalau tidak tangganya tak pernah berhenti");
+
+        assert_eq!(
+            drops,
+            GUEST_ATTEMPTS.len() - 1,
+            "tingkat yang membuang foto harus yang terakhir"
+        );
+    }
+
+    /// Meringankan foto bukan membuangnya.
+    ///
+    /// [`Attempt::SmallerPhotos`] ada untuk menguji dugaan ukuran berkas, dan
+    /// ia tidak bisa mengujinya kalau fotonya sudah dibuang duluan — hasilnya
+    /// akan tampak sama saja dengan tingkat terakhir, dan dugaan itu tidak
+    /// pernah terjawab.
+    #[test]
+    fn the_shrinking_rung_keeps_every_photo_it_has() {
+        assert_eq!(Attempt::SmallerPhotos.max_photos(), None);
+        assert_eq!(Attempt::Full.max_photos(), None);
+        assert_eq!(Attempt::NoPhotos.max_photos(), Some(0));
+    }
 }

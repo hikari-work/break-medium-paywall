@@ -161,6 +161,111 @@ fn take_photos(photos: &mut usize, count: usize) -> bool {
     true
 }
 
+/// Lebar yang diminta kalau fotonya perlu dikecilkan — lihat
+/// [`with_smaller_photos`].
+///
+/// 320 bukan angka karangan: itu lebar yang Medium sendiri pakai untuk thumbnail
+/// embed (lihat `BlockDto::Embed::thumbnail_url`). Pada artikel terberat yang
+/// ditemukan (`1b4e3bff6795`, PNG 867 KB), `fit:320` menurunkannya ke 207 KB —
+/// sekitar seperempat — sementara `fit:140` cuma turun ke 44 KB dan sudah terlalu
+/// buram untuk dibaca. Yang lebih besar, `fit:500`, cuma turun ke 470 KB dan
+/// barangkali masih di atas batas yang sedang dicari.
+pub const SMALL_PHOTO_WIDTH: u32 = 320;
+
+/// Penanda lebar di URL CDN Medium: `…/v2/resize:fit:700/…`.
+const RESIZE_MARK: &str = "/resize:fit:";
+
+/// Post yang sama, dengan setiap fotonya diminta dalam lebar `width`.
+///
+/// # Kenapa ini ada
+///
+/// Hasil **inline** menolak sebagian artikel bergambar dengan *"invalid inline
+/// message content specified"*, sementara isi yang sama persis terkirim utuh di
+/// DM. Salah satu sebab yang belum terbukti: ukuran berkasnya. Artikel
+/// `1b4e3bff6795` membawa PNG 867 KB dan 753 KB dan ditolak; artikel
+/// `a61157615501` membawa PNG 308 KB dan lolos sebagai tamu tiga kali.
+///
+/// Menurunkan `resize:` adalah satu-satunya cara menguji dugaan itu **tanpa
+/// membuang fotonya**. Yang diuji di sini cuma lebar yang diminta; isinya tetap
+/// gambar yang sama, diambil dari CDN yang sama.
+///
+/// # Yang diubah, dan yang sengaja tidak
+///
+/// Hanya URL yang benar-benar jadi foto: `preview_image_url`, `Image`, dan
+/// `ImageRow`. `Embed::thumbnail_url` juga sebuah URL `resize:`, tapi ia tidak
+/// pernah dikirim sebagai foto — ia jatuh ke tautan di dalam paragraf, jadi
+/// mengecilkannya cuma membuat pratinjaunya lebih buram tanpa mengubah apa pun.
+///
+/// URL yang lebarnya sudah ≤ `width` dibiarkan apa adanya, dan begitu juga URL
+/// yang tidak memakai `resize:` sama sekali — termasuk bentuk `0*<hash>` tanpa
+/// ekstensi, yang memang kanonik: menambahkan `.jpeg`/`.jpg`/`.png` ke situ
+/// menghasilkan `404`. Jadi fungsi ini tidak pernah menyentuh bentuk URL, cuma
+/// satu angka di dalamnya.
+#[must_use]
+pub fn with_smaller_photos(post: &PostDto, width: u32) -> PostDto {
+    let mut smaller = post.clone();
+
+    smaller.meta.preview_image_url = smaller
+        .meta
+        .preview_image_url
+        .as_deref()
+        .map(|url| smaller_photo(url, width));
+
+    for block in &mut smaller.blocks {
+        match block {
+            BlockDto::Image { url, .. } => *url = smaller_photo(url, width),
+            BlockDto::ImageRow { images } => {
+                for image in images {
+                    image.url = smaller_photo(&image.url, width);
+                }
+            }
+            // Sengaja tanpa `_`: kalau `BlockDto` suatu hari punya varian
+            // bergambar lagi, yang ini harus gagal kompilasi alih-alih diam.
+            BlockDto::Heading { .. }
+            | BlockDto::Paragraph { .. }
+            | BlockDto::List { .. }
+            | BlockDto::Code { .. }
+            | BlockDto::Blockquote { .. }
+            | BlockDto::Embed { .. }
+            | BlockDto::Iframe { .. } => {}
+        }
+    }
+
+    smaller
+}
+
+/// URL yang sama, dengan lebar `resize:fit:` diturunkan ke `width`.
+///
+/// Yang tidak bisa dibaca sebagai URL `resize:fit:<angka>/` dikembalikan **apa
+/// adanya**, utuh: bentuk URL Medium lebih beragam daripada yang terlihat
+/// (`resize:fill:88:88` untuk avatar, `0*<hash>` tanpa ekstensi untuk gambar
+/// lama), dan menebak-nebak di situ menghasilkan URL yang tidak ada.
+///
+/// Hanya menurunkan, tidak pernah menaikkan: meminta berkas yang lebih besar
+/// daripada yang Medium pilih berarti membayar lebih untuk gambar yang sama.
+fn smaller_photo(url: &str, width: u32) -> String {
+    let Some(start) = url.find(RESIZE_MARK) else {
+        return url.to_string();
+    };
+
+    let digits = start + RESIZE_MARK.len();
+    let rest = &url[digits..];
+
+    let Some(end) = rest.find('/') else {
+        return url.to_string();
+    };
+
+    let Ok(current) = rest[..end].parse::<u32>() else {
+        return url.to_string();
+    };
+
+    if current <= width {
+        return url.to_string();
+    }
+
+    format!("{}{width}{}", &url[..digits], &rest[end..])
+}
+
 /// Pesan satu paragraf, tanpa apa pun yang lain.
 ///
 /// Dipakai [`crate::bot`] untuk menjawab panggilan tamu yang gagal: panggilan
@@ -1178,6 +1283,109 @@ mod tests {
         assert!(photos(usize::MAX) > 1, "fixture-nya memang bergambar");
         assert_eq!(photos(1), 1, "gambar pratinjau yang tersisa");
         assert_eq!(photos(0), 0);
+    }
+
+    /// Fungsi URL-nya sendiri: satu angka yang diturunkan, sisanya utuh.
+    ///
+    /// Bentuk URL Medium lebih beragam daripada yang terlihat di satu artikel,
+    /// dan setiap bentuk yang tidak dikenali harus lewat **apa adanya** —
+    /// menebaknya berarti mengirim Telegram URL yang tidak ada.
+    #[test]
+    fn a_smaller_photo_only_lowers_the_width_it_understands() {
+        let at = |url: &str| smaller_photo(url, SMALL_PHOTO_WIDTH);
+
+        assert_eq!(
+            at("https://miro.medium.com/v2/resize:fit:700/1*abc.png"),
+            "https://miro.medium.com/v2/resize:fit:320/1*abc.png"
+        );
+
+        // Bentuk tanpa ekstensi, `0*<hash>`: yang berubah cuma angkanya, dan
+        // ekstensinya memang tidak boleh ditambahkan — `.jpeg` di situ 404.
+        assert_eq!(
+            at("https://miro.medium.com/v2/resize:fit:700/0*HKeIgSA4Vmk9XQ8P"),
+            "https://miro.medium.com/v2/resize:fit:320/0*HKeIgSA4Vmk9XQ8P"
+        );
+
+        // Sudah cukup kecil: tidak ditulis ulang, dan tidak dinaikkan.
+        assert_eq!(
+            at("https://miro.medium.com/v2/resize:fit:200/1*abc.png"),
+            "https://miro.medium.com/v2/resize:fit:200/1*abc.png"
+        );
+
+        for untouched in [
+            // Avatar: `fill:`, bukan `fit:`.
+            "https://miro.medium.com/v2/resize:fill:88:88/1*abc.jpeg",
+            // Bukan CDN Medium.
+            "https://example.com/1*abc.png",
+            // `resize:fit:` tanpa lebar yang bisa dibaca.
+            "https://miro.medium.com/v2/resize:fit:/1*abc.png",
+            "https://miro.medium.com/v2/resize:fit:abc/1*abc.png",
+            "https://miro.medium.com/v2/resize:fit:700",
+        ] {
+            assert_eq!(at(untouched), untouched, "{untouched} tidak boleh berubah");
+        }
+    }
+
+    /// Mengecilkan itu mengganti lebar, bukan membuang foto.
+    #[test]
+    fn shrinking_rewrites_the_photos_that_get_sent() {
+        let mut meta = meta("Judul");
+        meta.preview_image_url = Some("https://x/resize:fit:700/1*hero.png".to_string());
+
+        let article = with_blocks(
+            post_with(meta),
+            vec![
+                BlockDto::ImageRow {
+                    images: vec![ImageDto {
+                        url: "https://x/resize:fit:700/1*row.png".to_string(),
+                        alt: String::new(),
+                    }],
+                },
+                image_block("https://x/resize:fit:700/1*body.png"),
+            ],
+        );
+
+        let sent = |post: &PostDto| {
+            serde_json::to_string(&render(post).message).expect("pesannya terserialisasi")
+        };
+
+        let smaller = with_smaller_photos(&article, SMALL_PHOTO_WIDTH);
+
+        assert_eq!(sent(&article).matches("fit:700").count(), 3);
+        assert_eq!(
+            sent(&smaller).matches("fit:320").count(),
+            3,
+            "gambar pratinjau, satu baris, dan satu gambar isi"
+        );
+        assert!(!sent(&smaller).contains("fit:700"));
+    }
+
+    /// Pada jawaban server yang sungguhan, dengan sebelas gambar.
+    ///
+    /// Post karangan di atas membuktikan penalarannya konsisten dengan dirinya
+    /// sendiri; yang ini membuktikan URL yang benar-benar dikirim `/api/v1`
+    /// bisa dibaca ulang. Bentuk aslinya juga harus punya `fit:700`, kalau tidak
+    /// pemeriksaannya cuma lolos karena tidak ada yang perlu diubah.
+    #[test]
+    fn shrinking_a_real_api_answer_keeps_the_photos_and_lowers_them() {
+        let article = real();
+        let sent = |post: &PostDto| {
+            let rendered = rich_message(post, BASE_URL);
+
+            (
+                serde_json::to_string(&rendered.message).expect("pesannya terserialisasi"),
+                budget::Cost::of_blocks(&rendered.message.blocks).media,
+            )
+        };
+
+        let (before, photos_before) = sent(&article);
+        let (after, photos_after) = sent(&with_smaller_photos(&article, SMALL_PHOTO_WIDTH));
+
+        assert!(photos_before > 1, "fixture-nya memang bergambar");
+        assert!(before.contains("fit:700"), "dan aslinya berukuran penuh");
+
+        assert_eq!(photos_after, photos_before, "mengecilkan bukan membuang");
+        assert!(!after.contains("fit:700"));
     }
 
     /// **Divergensi yang disengaja.** Telegram tidak punya blok kartu, jadi yang
